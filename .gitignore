@@ -1,0 +1,22 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Large Binary Files (RoboAssistant Models)
+*.weights
+*.tflite
+*.prototxt
+*.zip
+
+# Secret / User Specific Data
+config.json
+profiles.json
+test_profiles.json
+
+# IDEs
+.vscode/
+.idea/
+.DS_Store
