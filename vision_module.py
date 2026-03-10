@@ -21,9 +21,10 @@ except ImportError:
 from profile_manager import ProfileManager
 
 class VisionWorker:
-    def __init__(self, log_callback, brain):
+    def __init__(self, log_callback, brain=None, event_callback=None):
         self.log_callback = log_callback
         self.brain = brain
+        self.event_callback = event_callback
         self.running = False
         self.current_frame = None
         self.last_identity = "None"
@@ -31,7 +32,7 @@ class VisionWorker:
         self.face_metadata = [] # List of (location, name)
         self.object_metadata = [] # List of (box, label)
         self.latest_scene_description = "Waiting for analysis..."
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         
         # LM Studio / Local API Settings
         self.api_url = "http://localhost:1234/v1/chat/completions" # Default LM Studio Port
@@ -39,24 +40,15 @@ class VisionWorker:
         # Low power motion/face detection setup
         self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
         
-        # Real-Time Object Detection (YOLOv4-tiny)
-        self.net = cv2.dnn.readNet("yolov4-tiny.weights", "yolov4-tiny.cfg")
-        if cv2.cuda.getCudaEnabledDeviceCount() > 0:
-            self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
-            self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
-        else:
-            self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
-            self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
-            
-        with open("coco.names", "r") as f:
-            self.coco_classes = [line.strip() for line in f.readlines()]
-            
-        try:
-            layer_names = self.net.getLayerNames()
-            self.output_layers = [layer_names[i - 1] for i in self.net.getUnconnectedOutLayers()]
-        except:
-            # Handle different OpenCV versions
-            self.output_layers = self.net.getUnconnectedOutLayersNames()
+        self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+        
+        # Models will be loaded dynamically by the ModeManager
+        self.net = None
+        self.output_layers = []
+        self.coco_classes = []
+        self.known_face_encodings = []
+        self.known_face_names = []
+        self.profile_manager = ProfileManager()
 
         self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=50, detectShadows=False)
         self.last_motion_time = 0.0
@@ -68,12 +60,56 @@ class VisionWorker:
         self.last_known_face_locations = []
         self.last_known_face_names = []
         
+        # Proactive Interaction State
+        self.last_stable_identity = "None"
+        self.identity_stability_counter = 0
+        self.potential_identity = "None"
+        self.last_pulse_time = time.time()
+        self.pulse_interval = 15.0 # Seconds between context refreshes when person present
+        
+        # Distraction Tracking
+        self.last_distraction_time = 0.0
+        self.active_distractions = []
+        
+        self.proactive_pulse_enabled = True # Configured by main_ui
+        
         self.log_callback("[VISION] Environment: Windows/Native. Using API-based inference.")
         
-        self.profile_manager = ProfileManager()
-        self.known_face_encodings = []
-        self.known_face_names = []
-        self._refresh_profiles()
+        self.log_callback("[VISION] Environment: Windows/Native. Using API-based inference.")
+
+    def load_models(self, required_models):
+        self.log_callback(f"[VISION] Loading required models: {required_models}")
+        with self.lock:
+            # Load YOLO if needed
+            if "yolo" in required_models:
+                if self.net is None:
+                    self.log_callback("[VISION] Loading YOLOv4-tiny...")
+                    self.net = cv2.dnn.readNet("yolov4-tiny.weights", "yolov4-tiny.cfg")
+                    if cv2.cuda.getCudaEnabledDeviceCount() > 0:
+                        self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
+                        self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
+                    else:
+                        self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+                        self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+                        
+                    with open("coco.names", "r") as f:
+                        self.coco_classes = [line.strip() for line in f.readlines()]
+                        
+                    try:
+                        layer_names = self.net.getLayerNames()
+                        self.output_layers = [layer_names[i - 1] for i in self.net.getUnconnectedOutLayers()]
+                    except:
+                        self.output_layers = self.net.getUnconnectedOutLayersNames()
+            else:
+                self.net = None # Unload to save VRAM
+
+            # Load Face Recognition if needed
+            if "face_rec" in required_models:
+                self.log_callback("[VISION] Loading Face Recognition Profiles...")
+                self._refresh_profiles()
+            else:
+                self.known_face_encodings = []
+                self.known_face_names = []
 
     def _refresh_profiles(self):
         """Reloads profiles and their encodings."""
@@ -154,56 +190,102 @@ class VisionWorker:
             else:
                 # Fallback to fast Haar boxes if no recognition has run yet
                 for (x, y, w, h) in faces:
-                    metadata.append(((y, x+w, y+h, x), "Detecting..."))
+                    metadata.append(((int(y), int(x+w), int(y+h), int(x)), "Detecting..."))
 
         # 2. FAST Object Detection (YOLOv4-tiny)
         fast_objects = []
-        height, width = frame.shape[:2]
+        if self.net is not None:
+            height, width = frame.shape[:2]
+            
+            # Fast DNN trigger (skip frames to save CPU if needed, but YOLOv4-tiny is fast)
+            blob = cv2.dnn.blobFromImage(frame, 1/255.0, (320, 320), swapRB=True, crop=False)
+            self.net.setInput(blob)
+            outs = self.net.forward(self.output_layers)
         
-        # Fast DNN trigger (skip frames to save CPU if needed, but YOLOv4-tiny is fast)
-        blob = cv2.dnn.blobFromImage(frame, 1/255.0, (320, 320), swapRB=True, crop=False)
-        self.net.setInput(blob)
-        outs = self.net.forward(self.output_layers)
-        
-        class_ids = []
-        confidences = []
-        boxes = []
-        
-        for out in outs:
-            for detection in out:
-                scores = detection[5:]
-                class_id = np.argmax(scores)
-                confidence = scores[class_id]
-                if confidence > 0.4: # Faster threshold
-                    center_x = int(detection[0] * width)
-                    center_y = int(detection[1] * height)
-                    w = int(detection[2] * width)
-                    h = int(detection[3] * height)
-                    x = int(center_x - w / 2)
-                    y = int(center_y - h / 2)
-                    boxes.append([x, y, w, h])
-                    confidences.append(float(confidence))
-                    class_ids.append(class_id)
-                    
-        # Apply Non-Max Suppression
-        indices = cv2.dnn.NMSBoxes(boxes, confidences, 0.4, 0.3)
-        if len(indices) > 0:
-            for i in indices.flatten():
-                x, y, w, h = boxes[i]
-                label = self.coco_classes[class_ids[i]]
-                # Map back to [ymin, xmin, ymax, xmax] format the UI expects
-                fast_objects.append(((y, x, y + h, x + w), label))
+            class_ids = []
+            confidences = []
+            boxes = []
+            
+            for out in outs:
+                for detection in out:
+                    scores = detection[5:]
+                    class_id = np.argmax(scores)
+                    confidence = scores[class_id]
+                    if confidence > 0.4: # Faster threshold
+                        center_x = int(detection[0] * width)
+                        center_y = int(detection[1] * height)
+                        w = int(detection[2] * width)
+                        h = int(detection[3] * height)
+                        x = int(center_x - w / 2)
+                        y = int(center_y - h / 2)
+                        boxes.append([x, y, w, h])
+                        confidences.append(float(confidence))
+                        class_ids.append(class_id)
+                        
+            # Apply Non-Max Suppression
+            indices = cv2.dnn.NMSBoxes(boxes, confidences, 0.4, 0.3)
+            if len(indices) > 0:
+                for i in indices.flatten():
+                    x, y, w, h = boxes[i]
+                    label = self.coco_classes[class_ids[i]]
+                    # Map back to [ymin, xmin, ymax, xmax] format the UI expects
+                    fast_objects.append(((int(y), int(x), int(y + h), int(x + w)), label))
 
         # Update real-time metadata for UI
         with self.lock:
             self.face_metadata = metadata
             self.object_metadata = fast_objects
-            # Sticky identity
-            if current_frame_identity != "None":
-                self.last_identity = current_frame_identity
-                self._identity_timeout = time.time()
-            elif time.time() - self._identity_timeout > 2.0:
-                self.last_identity = "None"
+            self.last_identity = current_frame_identity
+        
+        # 3. PROACTIVE EVENT DETECTION
+        # Identity Stability Check (requires 15 consistent frames)
+        if current_frame_identity == self.potential_identity and current_frame_identity != "None":
+            self.identity_stability_counter += 1
+        else:
+            self.potential_identity = current_frame_identity
+            self.identity_stability_counter = 0
+
+        if self.identity_stability_counter >= 15:
+            if current_frame_identity != self.last_stable_identity:
+                self.log_callback(f"[VISION] Identity stabilized: {current_frame_identity}")
+                self.last_stable_identity = current_frame_identity
+                if self.event_callback:
+                    self.event_callback("NEW_PERSON", current_frame_identity)
+            self.identity_stability_counter = 0 # Reset but keep stable state
+
+        # Clear stable identity if no face seen for a while
+        if current_frame_identity == "None":
+            self._identity_timeout += 0.03
+            if self._identity_timeout > 5.0: # 5 seconds of absence
+                self.last_stable_identity = "None"
+        else:
+            self._identity_timeout = 0.0
+
+        # Periodic Scene Pulse (VLM/Brain Refresh)
+        sees_person_or_face = current_frame_identity != "None" or len(faces) > 0 or any("person" in label.lower() for _, label in fast_objects)
+        
+        if sees_person_or_face and self.proactive_pulse_enabled:
+            if time.time() - self.last_pulse_time > self.pulse_interval:
+                self.log_callback("[VISION] Triggering periodic scene pulse...")
+                self.last_pulse_time = time.time()
+                identity_to_pass = self.last_stable_identity if self.last_stable_identity != "None" else "Unknown"
+                if self.event_callback:
+                    self.event_callback("PERIODIC_SCAN", identity_to_pass)
+
+        # Distraction Detection
+        if self.event_callback:
+            # Check if we should even look for distractions (we need a way to pass down active config, 
+            # but for now we'll just emit the objects and let the brain/UI filter them)
+            current_objects = [label for _, label in fast_objects]
+            if current_objects:
+                # We emit the event and the receiver checks if it's a known distraction and handles cooldowns.
+                # To prevent flooding, we'll only emit if the set of detected objects has changed, 
+                # or if it's been a few seconds.
+                current_time = time.time()
+                if current_objects != self.active_distractions or (current_time - self.last_distraction_time) > 2.0:
+                    self.active_distractions = current_objects.copy()
+                    self.last_distraction_time = current_time
+                    self.event_callback("OBJECTS_DETECTED", {"objects": current_objects, "identity": current_frame_identity})
 
         # Note: Background VLM polling has been completely removed.
         # VLM analysis is now 100% on-demand via `get_immediate_description`.
@@ -230,10 +312,61 @@ class VisionWorker:
         if objs:
             context.append(f"Nearby objects include: {', '.join(set(objs))}.")
             
-        if bg and "waiting" not in bg.lower():
-            context.append(f"Background context: {bg}")
-            
-        return " ".join(context)
+            if bg and "waiting" not in bg.lower():
+                context.append(f"Background context: {bg}")
+                
+            return " ".join(context)
+
+    def get_structured_reality(self):
+        """
+        Synchronously captures a frame, gets a VLM description, and packages 
+        the unified reality (Faces + YOLO Coordinates + VLM Statement) into a JSON dictionary.
+        """
+        frame = None
+        identity = "Unknown"
+        faces = []
+        ui_objects = []
+        
+        with self.lock:
+            if self.current_frame is not None:
+                frame = self.current_frame.copy()
+            identity = self.last_identity if self.last_identity != "None" else "Unknown"
+            faces = [(f[0], f[1]) for f in self.face_metadata if f[1] != "Unknown"]
+            ui_objects = list(self.object_metadata) # ((ymin, xmin, ymax, xmax), label)
+
+        vlm_desc = "No frame available."
+        if frame is not None:
+            self.log_callback("[VISION] Capturing frame for Structured Sensor Fusion...")
+            vlm_desc = self._vlm_inference(frame) or "Failed to generate visual description."
+
+        spatial_data = []
+        for box, label in ui_objects:
+            ymin, xmin, ymax, xmax = box
+            # Calculate pixel center points
+            x_center = int((xmin + xmax) / 2)
+            y_center = int((ymin + ymax) / 2)
+            spatial_data.append({
+                "label": label,
+                "coordinates": [x_center, y_center]
+            })
+
+        # Optionally add known faces to spatial data
+        for face_box, face_name in faces:
+            ymin, xmax, ymax, xmin = face_box
+            x_center = int((xmin + xmax) / 2)
+            y_center = int((ymin + ymax) / 2)
+            spatial_data.append({
+                "label": f"Face: {face_name}",
+                "coordinates": [x_center, y_center]
+            })
+
+        reality_dict = {
+            "User Identity": identity,
+            "Contextual Description": vlm_desc,
+            "Spatial Data": spatial_data
+        }
+        
+        return reality_dict
 
     def get_immediate_description(self):
         """

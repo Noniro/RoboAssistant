@@ -102,15 +102,37 @@ class RobotSupervisorApp(ctk.CTk):
         from arm_control import ArmController
         from brain_module import ReasoningBridge
         from vision_module import VisionWorker
+        from mode_manager import ModeManager
+        
+        self.mode_manager = ModeManager()
+        
+        # Launcher UI
+        self.launcher_frame = ctk.CTkFrame(self.sidebar_frame)
+        self.launcher_frame.pack(pady=10, padx=20, fill="x")
+        
+        ctk.CTkLabel(self.launcher_frame, text="System Mode:", font=ctk.CTkFont(weight="bold")).pack(side="left", padx=5)
+        self.mode_var = ctk.StringVar(value=self.mode_manager.current_mode)
+        self.mode_dropdown = ctk.CTkOptionMenu(
+            self.launcher_frame, 
+            values=list(self.mode_manager.MODES.keys()),
+            variable=self.mode_var,
+            command=self.on_mode_change
+        )
+        self.mode_dropdown.pack(side="left", expand=True, fill="x", padx=5)
+
+        self.mode_settings_btn = ctk.CTkButton(
+            self.launcher_frame, text="⚙ Settings", width=80, command=self.open_mode_settings
+        )
+        self.mode_settings_btn.pack(side="left", padx=5)
         
         self.arm = ArmController(self.log_event)
         self.brain = ReasoningBridge(self.log_event, self.arm)
-        self.vision = VisionWorker(self.log_event, self.brain)
+        self.vision = VisionWorker(self.log_event, self.brain, event_callback=self.handle_vision_event)
         self.brain.vision_worker = self.vision # Link them back
 
         # Collapsible Settings Frame
         self.settings_visible = False
-        self.settings_frame = ctk.CTkFrame(self.sidebar_frame)
+        self.settings_frame = ctk.CTkScrollableFrame(self.sidebar_frame)
         
         # Camera Selection
         ctk.CTkLabel(self.settings_frame, text="Camera").pack(pady=(5,0))
@@ -155,6 +177,15 @@ class RobotSupervisorApp(ctk.CTk):
             self.voice_dropdown.set(self.voice_names[0])
             
         self.voice_dropdown.pack(pady=5, padx=10, fill="x")
+
+        # Volume Slider
+        ctk.CTkLabel(self.settings_frame, text="Volume").pack(pady=(5,0))
+        self.volume_var = ctk.DoubleVar(value=self.settings.get("volume", 1.0))
+        self.volume_slider = ctk.CTkSlider(self.settings_frame, from_=0.0, to=1.0, variable=self.volume_var, command=self.change_volume)
+        self.volume_slider.pack(pady=5, padx=10, fill="x")
+        self.brain.tts.set_volume(self.volume_var.get())
+
+
 
         # Recognized Person Label
         self.person_label = ctk.CTkLabel(self.sidebar_frame, text="Recognized: None", font=ctk.CTkFont(size=14, slant="italic"))
@@ -236,12 +267,22 @@ class RobotSupervisorApp(ctk.CTk):
         self.settings["mic_name"] = self.mic_dropdown.get()
         self.settings["spk_name"] = self.spk_dropdown.get()
         self.settings["voice_name"] = self.voice_dropdown.get()
+        if hasattr(self, 'volume_var'):
+            self.settings["volume"] = self.volume_var.get()
 
         try:
             with open(self.settings_file, "w") as f:
                 json.dump(self.settings, f, indent=4)
         except Exception as e:
             self.log_event(f"[SYSTEM] ERROR: Could not save settings: {e}")
+
+    def on_mode_change(self, choice):
+        self.mode_manager.set_mode(choice)
+        self.log_event(f"[SYSTEM] Mode selected: {choice}. Waiting for initialization.")
+
+    def open_mode_settings(self):
+        mode = self.mode_var.get()
+        ModeSettingsWindow(self, mode)
 
     def change_camera(self, choice):
         # Find index
@@ -278,6 +319,59 @@ class RobotSupervisorApp(ctk.CTk):
                 self.brain.tts.set_voice(v["id"])
                 break
 
+    def change_volume(self, val):
+        if hasattr(self, 'volume_var'):
+            self.save_settings()
+        self.brain.tts.set_volume(float(val))
+
+    def handle_vision_event(self, event_type, data):
+        """Called by VisionWorker when something interesting happens."""
+        # Use a thread so we don't block the vision loop
+        threading.Thread(target=self._proactive_think_thread, args=(event_type, data), daemon=True).start()
+
+    def _proactive_think_thread(self, event_type, data):
+        mode_config = self.mode_manager.get_current_settings()
+        
+        # Check if proactive speech is enabled for this mode
+        if not mode_config.get("proactive_pulse", True):
+            return
+            # Only Study mode cares about objects purely for spontaneous reprimand 
+            if self.mode_manager.current_mode != "Study":
+                return
+                
+            detected_objects = data.get("objects", [])
+            distractions = mode_config.get("distraction_objects", [])
+            
+            # Check if any detected object is in the distraction list
+            found_distraction = next((obj for obj in detected_objects if obj in distractions), None)
+            
+            if found_distraction:
+                self.log_event(f"[SYSTEM] Distraction detected: {found_distraction}")
+                # Treat this as a targeted distraction event rather than general proactive thought
+                identity = data.get("identity", "Unknown")
+                scene_context = f"The user is visibly interacting with or holding a {found_distraction}."
+                
+                # Cooldown check happens in Brain Module automatically if we tell it it's a DISTRACTION
+                dialogue = self.brain.proactive_reasoning(scene_context, identity=identity, event_type="DISTRACTION", mode_config=mode_config)
+                if dialogue:
+                    self.after(0, self.append_to_chat, f"Brain: {dialogue}")
+            return
+                
+        # For standard PERIODIC or NEW_PERSON pulses
+        if not mode_config.get("proactive_pulse", True):
+            return  # Feature disabled in current mode settings
+            
+        identity = data if event_type == "NEW_PERSON" else self.vision.last_identity
+        
+        # Get fresh context (Face + Object + VLM)
+        scene_context = self.vision.get_unified_context()
+        
+        # Brain decides whether to speak
+        mode_config["name"] = self.mode_manager.current_mode
+        dialogue = self.brain.proactive_reasoning(scene_context, identity=identity, event_type=event_type, mode_config=mode_config)
+        if dialogue:
+            self.after(0, self.append_to_chat, f"Brain: {dialogue}")
+
     def send_chat(self):
         user_text = self.user_input.get()
         if not user_text.strip():
@@ -304,10 +398,28 @@ class RobotSupervisorApp(ctk.CTk):
         self.system_running = not self.system_running
         if self.system_running:
             self.control_btn.configure(text="Stop System")
+            self.mode_dropdown.configure(state="disabled") # Lock mode during run
+            
+            # Load only the models required for the current mode
+            mode_config = self.mode_manager.get_current_settings()
+            req_models = mode_config.get("required_models", [])
+            
+            self.log_event(f"[SYSTEM] Initializing {self.mode_manager.current_mode} Mode...")
+            
+            # 1. Load Brain models (VLM flag + Base Prompt)
+            base_prompt = mode_config.get("base_prompt")
+            self.brain.load_models(req_models, base_prompt=base_prompt)
+            self.brain.set_physical_interaction(mode_config.get("allow_physical_interaction", False))
+            
+            # 2. Load Vision models (YOLO / FaceRec)
+            self.vision.load_models(req_models)
+            self.vision.proactive_pulse_enabled = mode_config.get("proactive_pulse", True)
+            
             self.log_event("[SYSTEM] Starting AI routines...")
             self.vision.start()
         else:
-            self.control_btn.configure(text="Start System")
+            self.control_btn.configure(text="Initialize System")
+            self.mode_dropdown.configure(state="normal")
             self.log_event("[SYSTEM] Stopping AI routines...")
             self.vision.stop()
 
@@ -466,6 +578,151 @@ class ProfileManagerWindow(ctk.CTkToplevel):
             error_str = traceback.format_exc()
             self.parent.log_event(f"[PROFILES] FATAL ERROR during capture:\n{error_str}")
             print(f"Face Capture Crash:\n{error_str}")
+
+class ModeSettingsWindow(ctk.CTkToplevel):
+    def __init__(self, parent, mode_name):
+        super().__init__(parent)
+        self.parent = parent
+        self.mode_name = mode_name
+        self.title(f"{mode_name} Configuration")
+        self.geometry("450x550")
+        
+        # Make modal
+        self.transient(parent)
+        self.grab_set()
+
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(1, weight=1)
+
+        ctk.CTkLabel(self, text=f"{mode_name} Settings", font=ctk.CTkFont(size=20, weight="bold")).grid(row=0, column=0, pady=10)
+
+        self.scroll_frame = ctk.CTkScrollableFrame(self)
+        self.scroll_frame.grid(row=1, column=0, padx=20, pady=10, sticky="nsew")
+
+        self.settings = dict(self.parent.mode_manager.config[mode_name])
+        self.widgets = {}
+        self.cooldown_frame = None
+
+        # Dynamically create widgets based on type
+        for key, value in self.settings.items():
+            if key == "required_models":
+                continue # Skip internal settings
+            
+            if self.mode_name == "Study" and key == "proactive_pulse":
+                continue # Study mode handles distraction internally, no global proactive pulse
+            
+            frame = ctk.CTkFrame(self.scroll_frame)
+            frame.pack(fill="x", pady=5, padx=5)
+            
+            label_text = key.replace("_", " ").title()
+            ctk.CTkLabel(frame, text=label_text, width=150, anchor="w").pack(side="left", padx=10, pady=5)
+            
+            if isinstance(value, bool):
+                var = ctk.BooleanVar(value=value)
+                
+                # Special handling for General mode's proactive_pulse
+                if self.mode_name == "General" and key == "proactive_pulse":
+                    switch = ctk.CTkSwitch(frame, text="", variable=var, command=self.toggle_cooldown_visibility)
+                    switch.pack(side="right", padx=10, pady=5)
+                    self.widgets[key] = (var, switch)
+                    
+                    self.cooldown_frame = ctk.CTkFrame(self.scroll_frame)
+                    # We will pack this based on the initial var value
+                    ctk.CTkLabel(self.cooldown_frame, text="Cooldown (seconds)", width=150, anchor="w").pack(side="left", padx=10, pady=5)
+                    # Use StringVar instead of IntVar to prevent TclError on empty string
+                    cd_var = ctk.StringVar(value=str(self.settings.get("cooldown_seconds", 60)))
+                    cd_entry = ctk.CTkEntry(self.cooldown_frame, textvariable=cd_var, width=100)
+                    cd_entry.pack(side="right", padx=10, pady=5)
+                    self.widgets["cooldown_seconds"] = (cd_var, cd_entry)
+                    
+                    if value and self.cooldown_frame is not None:
+                        self.cooldown_frame.pack(fill="x", pady=5, padx=5)
+                else:
+                    switch = ctk.CTkSwitch(frame, text="", variable=var)
+                    switch.pack(side="right", padx=10, pady=5)
+                    self.widgets[key] = (var, switch)
+            elif isinstance(value, list):
+                # list of strings
+                var = ctk.StringVar(value=", ".join(value))
+                entry = ctk.CTkEntry(frame, textvariable=var, width=200)
+                entry.pack(side="right", padx=10, pady=5)
+                self.widgets[key] = (var, entry)
+            elif isinstance(value, int) and not isinstance(value, bool):
+                if key == "action_level":
+                    var_str = ctk.StringVar(value=str(value))
+                    opt = ctk.CTkOptionMenu(frame, values=["1", "2", "3"], variable=var_str)
+                    opt.pack(side="right", padx=10, pady=5)
+                    self.widgets[key] = (var_str, opt)
+                else:
+                    var = ctk.IntVar(value=value)
+                    entry = ctk.CTkEntry(frame, textvariable=var, width=100)
+                    entry.pack(side="right", padx=10, pady=5)
+                    self.widgets[key] = (var, entry)
+            elif isinstance(value, str):
+                var = ctk.StringVar(value=value)
+                if key == "threat_target":
+                    opt = ctk.CTkOptionMenu(frame, values=["unknown_faces", "everyone", "specific_profiles"], variable=var)
+                    opt.pack(side="right", padx=10, pady=5)
+                    self.widgets[key] = (var, opt)
+                else:
+                    entry = ctk.CTkEntry(frame, textvariable=var, width=200)
+                    entry.pack(side="right", padx=10, pady=5)
+                    self.widgets[key] = (var, entry)
+                    
+        btn_frame = ctk.CTkFrame(self)
+        btn_frame.grid(row=2, column=0, pady=10, padx=20, sticky="ew")
+        
+        ctk.CTkButton(btn_frame, text="Save & Close", command=self.save_settings).pack(side="right", padx=10, pady=10)
+        ctk.CTkButton(btn_frame, text="Cancel", fg_color="gray", command=self.destroy).pack(side="right", padx=10, pady=10)
+
+    def toggle_cooldown_visibility(self):
+        if "proactive_pulse" in self.widgets and self.cooldown_frame is not None:
+            is_checked = self.widgets["proactive_pulse"][0].get()
+            if is_checked:
+                # Find the index of the proactive pulse frame to insert right below it
+                idx = 0
+                for widget in self.scroll_frame.winfo_children():
+                    if 'proactive_pulse' in str(widget):
+                        break
+                    idx += 1
+                self.cooldown_frame.pack(fill="x", pady=5, padx=5, after=self.scroll_frame.winfo_children()[idx - 1] if idx > 0 else None)
+            else:
+                self.cooldown_frame.pack_forget()
+
+    def save_settings(self):
+        for key, (var, widget) in self.widgets.items():
+            try:
+                val = var.get()
+            except Exception:
+                val = ""
+                
+            orig_val = self.settings.get(key)
+            if key == "cooldown_seconds":
+                try:
+                    self.settings[key] = int(val)
+                except ValueError:
+                    self.settings[key] = orig_val if orig_val is not None else 60
+            elif isinstance(orig_val, list):
+                # convert back to list
+                self.settings[key] = [x.strip() for x in str(val).split(",") if x.strip()]
+            elif isinstance(orig_val, int) and not isinstance(orig_val, bool) and key == "action_level":
+                self.settings[key] = int(val)
+            else:
+                self.settings[key] = val
+                
+        # Manually update the config manager to avoid direct dict manipulation issues
+        current_config = self.parent.mode_manager.config[self.mode_name]
+        for k, v in self.settings.items():
+            current_config[k] = v
+            
+        self.parent.mode_manager.save_config()
+        # Immediately reflect proactive/physical changes to modules if running
+        if self.mode_name == self.parent.mode_manager.current_mode:
+             self.parent.vision.proactive_pulse_enabled = current_config.get("proactive_pulse", True)
+             self.parent.brain.set_physical_interaction(current_config.get("allow_physical_interaction", False))
+             
+        self.parent.log_event(f"[SYSTEM] Saved updated configurations for {self.mode_name} Mode.")
+        self.destroy()
 
 if __name__ == "__main__":
     app = RobotSupervisorApp()

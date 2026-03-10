@@ -8,6 +8,7 @@ class TTSManager:
         self.speech_queue = queue.Queue()
         self.running = True
         self.voice_id = voice_id
+        self.volume = 1.0
         
         # Start the background worker
         self.thread = threading.Thread(target=self._worker, daemon=True)
@@ -29,6 +30,7 @@ class TTSManager:
                         except Exception:
                             pass
                     
+                    engine.setProperty('volume', self.volume)
                     engine.say(text)
                     engine.runAndWait()
                     
@@ -44,6 +46,9 @@ class TTSManager:
         """Adds text to the speech queue to be spoken in the background."""
         if text and str(text).strip():
             self.speech_queue.put(str(text).strip())
+
+    def set_volume(self, volume):
+        self.volume = max(0.0, min(1.0, float(volume)))
 
     def get_available_voices(self):
         """Helper to return a list of available voice dictionaries."""

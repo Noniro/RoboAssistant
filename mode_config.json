@@ -1,0 +1,38 @@
+{
+    "General": {
+        "required_models": [
+            "yolo",
+            "face_rec",
+            "vlm"
+        ],
+        "base_prompt": "You are a helpful and playful lab assistant.",
+        "allow_physical_interaction": false,
+        "proactive_pulse": false,
+        "name": "General",
+        "cooldown_seconds": 30
+    },
+    "Study": {
+        "required_models": [
+            "yolo"
+        ],
+        "distraction_objects": [
+            "cell phone",
+            "remote"
+        ],
+        "action_level": 3,
+        "cooldown_seconds": 1,
+        "proactive_pulse": false,
+        "name": "Study"
+    },
+    "Security": {
+        "required_models": [
+            "yolo",
+            "face_rec"
+        ],
+        "enable_tracking": false,
+        "threat_target": "everyone",
+        "patrol_sweep": false,
+        "proactive_pulse": true,
+        "name": "Security"
+    }
+}
