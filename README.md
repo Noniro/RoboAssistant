@@ -1,4 +1,4 @@
-# RoboAssistant 🤖
+# RoboAssistant 
 
 A modular Robotic Lab Assistant with Real-Time Vision, Face Recognition, and LLM-powered reasoning.
 
