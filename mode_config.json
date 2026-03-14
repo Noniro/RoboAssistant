@@ -6,7 +6,7 @@
             "vlm"
         ],
         "base_prompt": "You are a helpful and playful lab assistant.",
-        "allow_physical_interaction": false,
+        "allow_physical_interaction": true,
         "proactive_pulse": false,
         "name": "General",
         "cooldown_seconds": 30

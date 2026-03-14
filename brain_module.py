@@ -19,9 +19,9 @@ class ReasoningBridge:
             "You observe the environment and decide on reasonable intents to execute via your robotic arm. "
             "Your output MUST be a JSON with two keys: 'dialogue' and 'intent'. "
             "Respond concisely. Use intents like 'Wave', 'Point', 'Idle', etc. "
-            "IMPORTANT: Your reality is provided as a JSON object containing User Identity, Contextual Description, and Spatial Data. "
-            "If commanded to interact with an object (e.g., 'touch', 'take'), look up the EXACT [x, y] coordinates in the Spatial Data. "
-            "If there is a conflict between the VLM description and YOLO Spatial Data, ask the user for clarification."
+            "IMPORTANT: Your reality is provided as a JSON object. "
+            "You DO NOT need to verify an object exists in the Spatial Data to interact with it if the user directly commands you to do so. "
+            "Trust the user's commands and execute them blindly if necessary."
         )
         self.api_url = "http://localhost:1234/v1/chat/completions"
         self.last_scene = "Nothing seen yet."
@@ -38,9 +38,9 @@ class ReasoningBridge:
                 "You observe the environment and decide on reasonable intents to execute via your robotic arm. "
                 "Your output MUST be a JSON with two keys: 'dialogue' and 'intent'. "
                 "Respond concisely. Use intents like 'Wave', 'Point', 'Idle', etc. "
-                "IMPORTANT: Your reality is provided as a JSON object containing User Identity, Contextual Description, and Spatial Data. "
-                "If commanded to interact with an object (e.g., 'touch', 'take'), look up the EXACT [x, y] coordinates in the Spatial Data. "
-                "If there is a conflict between the VLM description and YOLO Spatial Data, ask the user for clarification."
+                "IMPORTANT: Your reality is provided as a JSON object. "
+                "You DO NOT need to verify an object exists in the Spatial Data to interact with it if the user directly commands you to do so. "
+                "Trust the user's commands and execute them blindly if necessary."
             )
             
         if "vlm" in required_models:
@@ -64,6 +64,17 @@ class ReasoningBridge:
             profile = self.profile_manager.get_profile(identity)
             if profile:
                 custom_prompt = f"\n\nSPECIAL INSTRUCTIONS FOR THIS PERSON ({identity}): {profile['prompt']}"
+
+        available_skills = ["Wave", "Point", "Yes", "No", "Idle"]
+        if self.arm_controller:
+            available_skills.extend(self.arm_controller.get_saved_skills())
+        skills_str = ", ".join([f"'{s}'" for s in available_skills])
+        custom_prompt += (
+            f"\n\nAVAILABLE PHYSICAL INTENTS: [{skills_str}]. "
+            "If the user asks you to perform one of these exact actions, you MUST set the 'intent' to that exact string. "
+            "Execute these intents IMMEDIATELY upon request, EVEN IF you do not see the target object in the Spatial Data (they are blind recorded trajectories). "
+            "You MUST output valid JSON ONLY, strictly containing 'dialogue' and 'intent' keys. Do NOT use markdown code formatting blocks."
+        )
 
         messages = [
             {"role": "system", "content": self.system_prompt + custom_prompt},
@@ -137,6 +148,17 @@ class ReasoningBridge:
             if profile:
                 custom_prompt = f"\n\nSPECIAL INSTRUCTIONS FOR THIS PERSON ({identity}): {profile['prompt']}"
 
+        available_skills = ["Wave", "Point", "Yes", "No", "Idle"]
+        if self.arm_controller:
+            available_skills.extend(self.arm_controller.get_saved_skills())
+        skills_str = ", ".join([f"'{s}'" for s in available_skills])
+        custom_prompt += (
+            f"\n\nAVAILABLE PHYSICAL INTENTS: [{skills_str}]. "
+            "If the user asks you to perform one of these exact actions, you MUST set the 'intent' to that exact string. "
+            "Execute these intents IMMEDIATELY upon request, EVEN IF you do not see the target object in the Spatial Data (they are blind recorded trajectories). "
+            "You MUST output valid JSON ONLY, strictly containing 'dialogue' and 'intent' keys. Do NOT use markdown code formatting blocks."
+        )
+
         messages = [{"role": "system", "content": self.system_prompt + custom_prompt}]
         messages.extend(self.chat_history)
         messages.append({"role": "user", "content": f"Structured Reality JSON:\n{vision_context}\n\nUser says: {user_text}"})
@@ -154,7 +176,7 @@ class ReasoningBridge:
                 result = response.json()
                 response_text = result['choices'][0]['message']['content'].strip()
                 
-                # Attempt to parse JSON if model follows instructions, else just use text
+                # Attempt to parse JSON if model follows instructions, else fallback to regex
                 try:
                     json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
                     if json_match:
@@ -162,12 +184,13 @@ class ReasoningBridge:
                         dialogue = parsed.get('dialogue', response_text)
                         intent = parsed.get('intent', "Idle")
                     else:
-                        dialogue = response_text
-                        intent = "Idle"
-                except json.JSONDecodeError as e:
-                    self.log_callback(f"[BRAIN-CHAT] JSON Parse Error: {e}")
-                    dialogue = response_text
-                    intent = "Idle"
+                        raise ValueError("No JSON block found")
+                except Exception as e:
+                    self.log_callback(f"[BRAIN-CHAT] JSON Parse Error: {e}, attempting regex extraction on: {response_text}")
+                    d_match = re.search(r'"dialogue"\s*:\s*"([^"]+)"', response_text, re.IGNORECASE)
+                    i_match = re.search(r'"intent"\s*:\s*"([^"]+)"', response_text, re.IGNORECASE)
+                    dialogue = d_match.group(1) if d_match else response_text.replace('{', '').replace('}', '').replace('"', '').strip()
+                    intent = i_match.group(1) if i_match else "Idle"
                     
                 self.chat_history.append({"role": "user", "content": user_text})
         
@@ -252,6 +275,17 @@ class ReasoningBridge:
             if profile:
                 custom_prompt = f"\n\nPROFILE SPECIFIC: {profile['prompt']}"
 
+        available_skills = ["Wave", "Point", "Yes", "No", "Idle"]
+        if self.arm_controller:
+            available_skills.extend(self.arm_controller.get_saved_skills())
+        skills_str = ", ".join([f"'{s}'" for s in available_skills])
+        custom_prompt += (
+            f"\n\nAVAILABLE PHYSICAL INTENTS: [{skills_str}]. "
+            "If the user asks you to perform one of these exact actions, you MUST set the 'intent' to that exact string. "
+            "Execute these intents IMMEDIATELY upon request, EVEN IF you do not see the target object in the Spatial Data. "
+            "You MUST output valid JSON ONLY, strictly containing 'dialogue' and 'intent' keys. Do NOT use markdown code formatting blocks."
+        )
+
         messages = [{"role": "system", "content": proactive_prompt + custom_prompt}]
         messages.extend(self.chat_history)
         messages.append({"role": "user", "content": f"Event: {event_type}. Scene: {scene_description}. Should you say anything?"})
@@ -274,11 +308,12 @@ class ReasoningBridge:
                         dialogue = parsed.get('dialogue', "")
                         intent = parsed.get('intent', "Idle")
                     else:
-                        dialogue = "" # Default to silence if malformed
-                        intent = "Idle"
-                except json.JSONDecodeError:
-                    dialogue = ""
-                    intent = "Idle"
+                        raise ValueError("No JSON block found")
+                except Exception:
+                    d_match = re.search(r'"dialogue"\s*:\s*"([^"]+)"', response_text, re.IGNORECASE)
+                    i_match = re.search(r'"intent"\s*:\s*"([^"]+)"', response_text, re.IGNORECASE)
+                    dialogue = d_match.group(1) if d_match else ""
+                    intent = i_match.group(1) if i_match else "Idle"
                     
                 if dialogue:
                     self.log_event_internal(f"[PROACTIVE] {dialogue}")

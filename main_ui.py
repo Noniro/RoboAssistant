@@ -58,6 +58,16 @@ class RobotSupervisorApp(ctk.CTk):
         self.camera_frame = ctk.CTkFrame(self)
         self.camera_frame.grid(row=0, column=0, padx=10, pady=10, sticky="nsew")
         
+        # Arm Test Button Area
+        self.arm_cmds_frame = ctk.CTkFrame(self.camera_frame, fg_color="transparent")
+        self.arm_cmds_frame.pack(side="top", pady=10)
+        
+        self.arm_test_btn = ctk.CTkButton(self.arm_cmds_frame, text="🦾 Arm Basic Commands", fg_color="#b54309", hover_color="#8c3305", command=self.open_arm_commands)
+        self.arm_test_btn.pack(side="left", padx=5)
+
+        self.arm_manual_btn = ctk.CTkButton(self.arm_cmds_frame, text="🕹 Manual Motor Control", fg_color="#0955b5", hover_color="#05338c", command=self.open_manual_motor_control)
+        self.arm_manual_btn.pack(side="left", padx=5)
+        
         self.video_label = ctk.CTkLabel(self.camera_frame, text="")
         self.video_label.pack(expand=True, fill="both")
 
@@ -478,6 +488,12 @@ class RobotSupervisorApp(ctk.CTk):
     def open_profiles(self):
         ProfileManagerWindow(self)
 
+    def open_arm_commands(self):
+        ArmCommandsWindow(self)
+
+    def open_manual_motor_control(self):
+        ManualMotorControlWindow(self)
+
     def on_closing(self):
         self.cap.release()
         self.vision.stop()
@@ -723,6 +739,160 @@ class ModeSettingsWindow(ctk.CTkToplevel):
              
         self.parent.log_event(f"[SYSTEM] Saved updated configurations for {self.mode_name} Mode.")
         self.destroy()
+
+class ArmCommandsWindow(ctk.CTkToplevel):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.parent = parent
+        self.title("Arm Basic Commands & Skills")
+        self.geometry("350x650")
+        
+        # Make it stay on top
+        self.attributes("-topmost", True)
+        self.transient(parent)
+
+        self.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(self, text="Motions & Skills", font=ctk.CTkFont(size=18, weight="bold")).pack(pady=10)
+
+        self.scroll_frame = ctk.CTkScrollableFrame(self)
+        self.scroll_frame.pack(expand=True, fill="both", padx=10, pady=5)
+        
+        self.refresh_skill_list()
+        
+        # Teleop Section
+        self.teleop_frame = ctk.CTkFrame(self)
+        self.teleop_frame.pack(fill="x", padx=10, pady=(10, 5))
+        
+        self.teleop_btn = ctk.CTkButton(self.teleop_frame, text="🟢 Start Teleoperation", fg_color="#098c1b", hover_color="#056312", command=self.toggle_teleop)
+        self.teleop_btn.pack(pady=5, padx=10, fill="x")
+
+        # Recording Section
+        self.record_frame = ctk.CTkFrame(self)
+        self.record_frame.pack(fill="x", padx=10, pady=5)
+        
+        ctk.CTkLabel(self.record_frame, text="Create New Skill (Leader Arm)", font=ctk.CTkFont(weight="bold")).pack(pady=5)
+        
+        self.skill_name_var = ctk.StringVar()
+        self.skill_entry = ctk.CTkEntry(self.record_frame, textvariable=self.skill_name_var, placeholder_text="Skill Name...")
+        self.skill_entry.pack(pady=5, padx=10, fill="x")
+        
+        self.record_btn = ctk.CTkButton(self.record_frame, text="🔴 Start Recording", fg_color="#b50909", hover_color="#8c0505", command=self.toggle_recording)
+        self.record_btn.pack(pady=5, padx=10, fill="x")
+
+        ctk.CTkButton(self, text="Close", fg_color="gray", command=self.destroy).pack(pady=10, side="bottom")
+
+    def refresh_skill_list(self):
+        for widget in self.scroll_frame.winfo_children():
+            widget.destroy()
+            
+        custom_skills = self.parent.arm.get_saved_skills()
+        commands = ["Wave", "Point", "Dance", "Yes", "No", "Reset Position"] + custom_skills
+        
+        for cmd in commands:
+            is_custom = cmd in custom_skills
+            btn_color = "#098c1b" if is_custom else ["#3B8ED0", "#1F6AA5"]
+            
+            f = ctk.CTkFrame(self.scroll_frame, fg_color="transparent")
+            f.pack(pady=5, padx=10, fill="x")
+            
+            btn = ctk.CTkButton(f, text=f"▶ {cmd}", fg_color=btn_color, command=lambda c=cmd, ic=is_custom: self.send_arm_command(c, ic))
+            btn.pack(side="left", expand=True, fill="x")
+            
+            if is_custom:
+                del_btn = ctk.CTkButton(f, text="X", width=30, fg_color="#b50909", hover_color="#8c0505", command=lambda c=cmd: self.delete_skill(c))
+                del_btn.pack(side="right", padx=(5, 0))
+
+    def delete_skill(self, skill_name):
+        if hasattr(self.parent.arm, 'delete_skill'):
+            success = self.parent.arm.delete_skill(skill_name)
+            if success:
+                self.refresh_skill_list()
+
+    def send_arm_command(self, cmd, is_custom):
+        self.parent.log_event(f"[GUI-ARM] Executing: {cmd}")
+        import threading
+        if is_custom:
+            threading.Thread(target=self.parent.arm.replay_skill, args=(cmd,), daemon=True).start()
+        else:
+            threading.Thread(target=self.parent.arm.execute_intent, args=(cmd.lower(), None), daemon=True).start()
+
+    def toggle_teleop(self):
+        if not self.parent.arm.teleoperating:
+            success = self.parent.arm.start_teleop()
+            if success:
+                self.teleop_btn.configure(text="⏹ Stop Teleoperation", fg_color="#b58c09", hover_color="#8c6a05")
+                self.record_btn.configure(state="disabled")
+        else:
+            self.parent.arm.stop_teleop()
+            self.teleop_btn.configure(text="🟢 Start Teleoperation", fg_color="#098c1b", hover_color="#056312")
+            self.record_btn.configure(state="normal")
+
+    def toggle_recording(self):
+        if not self.parent.arm.recording:
+            name = self.skill_name_var.get().strip()
+            if not name:
+                self.parent.log_event("[GUI-ARM] Please enter a skill name first.")
+                return
+            
+            success = self.parent.arm.start_recording(name)
+            if success:
+                self.record_btn.configure(text="⏹ Stop Recording", fg_color="#b58c09", hover_color="#8c6a05")
+                self.skill_entry.configure(state="disabled")
+                self.teleop_btn.configure(state="disabled")
+        else:
+            self.parent.arm.stop_recording()
+            self.record_btn.configure(text="🔴 Start Recording", fg_color="#b50909", hover_color="#8c0505")
+            self.skill_entry.configure(state="normal")
+            self.skill_name_var.set("")
+            self.teleop_btn.configure(state="normal")
+            self.refresh_skill_list()
+
+class ManualMotorControlWindow(ctk.CTkToplevel):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.parent = parent
+        self.title("Manual Motor Dashboard")
+        self.geometry("450x500")
+        
+        # Make it stay on top
+        self.attributes("-topmost", True)
+        self.transient(parent)
+
+        self.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(self, text="Manual Motor Dashboard", font=ctk.CTkFont(size=18, weight="bold")).pack(pady=15)
+        
+        self.scroll_frame = ctk.CTkScrollableFrame(self)
+        self.scroll_frame.pack(expand=True, fill="both", padx=10, pady=5)
+
+        motors = [
+            ("shoulder_pan", "Left", "Right"),
+            ("shoulder_lift", "Down", "Up"),
+            ("elbow_flex", "Down", "Up"),
+            ("wrist_flex", "Down", "Up"),
+            ("wrist_roll", "Left", "Right"),
+            ("gripper", "Close", "Open")
+        ]
+        
+        for motor, dir1, dir2 in motors:
+            f = ctk.CTkFrame(self.scroll_frame)
+            f.pack(fill="x", pady=5)
+            
+            ctk.CTkLabel(f, text=motor.replace("_", " ").title(), width=120, anchor="w").pack(side="left", padx=10)
+            
+            btn2 = ctk.CTkButton(f, text=dir2, width=80, command=lambda m=motor, d=dir2.lower(): self.move_motor(m, d))
+            btn2.pack(side="right", padx=5, pady=5)
+            
+            btn1 = ctk.CTkButton(f, text=dir1, width=80, command=lambda m=motor, d=dir1.lower(): self.move_motor(m, d))
+            btn1.pack(side="right", padx=5, pady=5)
+            
+        ctk.CTkButton(self, text="Close", fg_color="gray", command=self.destroy).pack(pady=10, side="bottom")
+
+    def move_motor(self, motor_name, direction):
+        self.parent.log_event(f"[GUI-ARM] Manual increment: {motor_name} -> {direction}")
+        import threading
+        threading.Thread(target=self.parent.arm.move_joint, args=(motor_name, direction), daemon=True).start()
 
 if __name__ == "__main__":
     app = RobotSupervisorApp()
