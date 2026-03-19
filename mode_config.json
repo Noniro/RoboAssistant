@@ -29,10 +29,13 @@
             "yolo",
             "face_rec"
         ],
-        "enable_tracking": false,
+        "enable_tracking": true,
+        "target_objects": [
+            "remote"
+        ],
         "threat_target": "everyone",
         "patrol_sweep": false,
-        "proactive_pulse": true,
+        "proactive_pulse": false,
         "name": "Security"
     }
 }

@@ -19,6 +19,7 @@ class ModeManager:
         "Security": {
             "required_models": ["yolo", "face_rec"], # No VLM needed
             "enable_tracking": True,
+            "target_objects": [], # Fill with YOLO labels like 'person', 'cell phone'
             "threat_target": "unknown_faces", # "unknown_faces", "everyone", "specific_profiles"
             "patrol_sweep": True,
             "proactive_pulse": True # Needs to monitor for threats

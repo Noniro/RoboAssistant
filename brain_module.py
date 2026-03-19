@@ -18,7 +18,7 @@ class ReasoningBridge:
             f"You are Yuval's Robotic Lab Assistant. {self.base_prompt} "
             "You observe the environment and decide on reasonable intents to execute via your robotic arm. "
             "Your output MUST be a JSON with two keys: 'dialogue' and 'intent'. "
-            "Respond concisely. Use intents like 'Wave', 'Point', 'Idle', etc. "
+            "Respond concisely. Use intents like 'Wave', 'Point', 'Idle', or a trained VLA policy name. "
             "IMPORTANT: Your reality is provided as a JSON object. "
             "You DO NOT need to verify an object exists in the Spatial Data to interact with it if the user directly commands you to do so. "
             "Trust the user's commands and execute them blindly if necessary."
@@ -28,6 +28,11 @@ class ReasoningBridge:
         self.chat_history = [] # Stores last 5 interactions to prevent amnesia
         self.enable_vlm_reasoning = True
         self.physical_interaction_enabled = False
+        
+        # VLA intent routing: { intent_string_from_LLM: vla_policy_name }
+        # e.g. { "pick_and_place": "pick_place_Iloveyoublock" }
+        self.vla_intents = {}
+        
         self.log_callback("[BRAIN] Environment: Windows. Reasoning via Local API (localhost:1234).")
 
     def load_models(self, required_models, base_prompt=None):
@@ -54,6 +59,110 @@ class ReasoningBridge:
         self.physical_interaction_enabled = enabled
         self.log_callback(f"[BRAIN] Physical Interaction {'Enabled' if enabled else 'Disabled'}")
 
+    def register_vla_intent(self, intent_name, policy_name):
+        """
+        Map an LLM intent string to a registered VLA policy name.
+        Example: register_vla_intent("pick_and_place", "pick_place_Iloveyoublock")
+        The arm_controller must have the policy registered via register_vla_policy().
+        """
+        self.vla_intents[intent_name.lower()] = policy_name
+        self.log_callback(f"[BRAIN] VLA intent registered: '{intent_name}' -> policy '{policy_name}'")
+
+    def _dispatch_intent(self, intent):
+        """
+        Central intent dispatcher. Checks if the intent is a VLA intent first,
+        then falls back to pre-programmed kinematics / recorded skills.
+        """
+        if not self.arm_controller or intent.lower() == "idle":
+            return
+        if not getattr(self, "physical_interaction_enabled", False):
+            self.log_callback(f"[BRAIN] Prevented arm movement '{intent}' (Physical Interaction OFF).")
+            return
+
+        intent_lower = intent.lower().strip()
+
+        # Check if this is a VLA intent
+        if intent_lower in self.vla_intents:
+            policy_name = self.vla_intents[intent_lower]
+            self.log_callback(f"[BRAIN] 🤖 VLA intent triggered: '{intent}' -> policy '{policy_name}'")
+            import threading
+            threading.Thread(
+                target=self._run_vla_and_react,
+                args=(policy_name,),
+                daemon=True
+            ).start()
+        else:
+            # Fallback: pre-programmed motion or recorded skill
+            self.arm_controller.execute_intent(intent, current_observation=None)
+
+    def _run_vla_and_react(self, policy_name):
+        ui = getattr(self, "ui_parent", None)
+        
+        # Safe start: Reset position before yielding to VLA policy
+        self.log_callback("[BRAIN] Resetting arm position for safety before VLA starts.")
+        self.arm_controller.execute_intent("reset position", None)
+        import time
+        time.sleep(1.0) # 1 sec wait for the arm to reach safe spot
+        
+        if ui:
+            ui.after(0, ui.suspend_for_external_script)
+            
+        process = self.arm_controller.run_vla_intent(policy_name, episode_time=90)
+        
+        success = False
+        if process:
+            try:
+                process.wait()
+                success = (process.returncode == 0)
+            except Exception as e:
+                self.log_callback(f"[BRAIN] VLA execution error: {e}")
+                
+        if ui:
+            ui.after(0, ui.resume_from_external_script)
+            
+        # Give hardware 2 seconds to re-initialize before triggering follow-up kinematic action
+        time.sleep(2.0)
+            
+        if success:
+            self.log_callback("[BRAIN] Task completed successfully! Trying to celebrate.")
+            # Verify Dance skill exists
+            if "Dance" in self.arm_controller.get_saved_skills():
+                self.arm_controller.replay_skill("Dance")
+            elif "dance" in self.arm_controller.get_saved_skills():
+                self.arm_controller.replay_skill("dance")
+            else:
+                self.arm_controller.execute_intent("dance", None)
+                
+            self.log_callback("[BRAIN] Task and celebration done. Returning to safe reset position.")
+            self.arm_controller.execute_intent("reset position", None)
+        else:
+            self.log_callback("[BRAIN] Task failed or was aborted. Resetting position.")
+            self.arm_controller.execute_intent("reset position", None)
+
+    def _build_skills_prompt(self):
+        """Build the AVAILABLE PHYSICAL INTENTS string shown to the LLM."""
+        available_skills = ["Wave", "Point", "Yes", "No", "Idle"]
+        if self.arm_controller:
+            available_skills.extend(self.arm_controller.get_saved_skills())
+        # Add VLA intents as usable intent strings
+        for vla_intent in self.vla_intents:
+            display = vla_intent
+            available_skills.append(display)
+        skills_str = ", ".join([f"'{s}'" for s in available_skills])
+        vla_note = ""
+        if self.vla_intents:
+            # Make sure it's ultra-clear for the LLM
+            vla_string = ", ".join([f"'{k}'" for k in self.vla_intents])
+            vla_note = (
+                f" \n\nVLA-TRAINED SKILLS (Real AI policies): [{vla_string}]. "
+                "If the user asks you to interact with or pick up an object (e.g., 'pick the block'), YOU MUST use the VLA-TRAINED SKILL that corresponds to that object, instead of 'Point' or 'Wave'."
+            )
+        return (
+            f"\n\nAVAILABLE PHYSICAL INTENTS: [{skills_str}].{vla_note} "
+            "If the user asks you to perform one of these exact actions, you MUST set the 'intent' to that exact string. "
+            "You MUST output valid JSON ONLY, strictly containing 'dialogue' and 'intent' keys. Do NOT use markdown code formatting blocks."
+        )
+
     def generate_dialogue_and_intent(self, scene_description, identity=None):
         self.last_scene = scene_description
         self.log_callback(f"[BRAIN] Reasoning over scene: {scene_description} (Seen: {identity or 'Unknown'})")
@@ -65,16 +174,7 @@ class ReasoningBridge:
             if profile:
                 custom_prompt = f"\n\nSPECIAL INSTRUCTIONS FOR THIS PERSON ({identity}): {profile['prompt']}"
 
-        available_skills = ["Wave", "Point", "Yes", "No", "Idle"]
-        if self.arm_controller:
-            available_skills.extend(self.arm_controller.get_saved_skills())
-        skills_str = ", ".join([f"'{s}'" for s in available_skills])
-        custom_prompt += (
-            f"\n\nAVAILABLE PHYSICAL INTENTS: [{skills_str}]. "
-            "If the user asks you to perform one of these exact actions, you MUST set the 'intent' to that exact string. "
-            "Execute these intents IMMEDIATELY upon request, EVEN IF you do not see the target object in the Spatial Data (they are blind recorded trajectories). "
-            "You MUST output valid JSON ONLY, strictly containing 'dialogue' and 'intent' keys. Do NOT use markdown code formatting blocks."
-        )
+        custom_prompt += self._build_skills_prompt()
 
         messages = [
             {"role": "system", "content": self.system_prompt + custom_prompt},
@@ -121,10 +221,7 @@ class ReasoningBridge:
         self.log_callback(f"[BRAIN] Intent determined: {intent}")
         
         self.tts.speak(dialogue)
-        
-        if self.arm_controller and intent.lower() != "idle":
-            self.arm_controller.execute_intent(intent, current_observation=None)
-        
+        self._dispatch_intent(intent)
         return dialogue, intent
 
     def manual_interact(self, user_text, identity=None):
@@ -148,16 +245,7 @@ class ReasoningBridge:
             if profile:
                 custom_prompt = f"\n\nSPECIAL INSTRUCTIONS FOR THIS PERSON ({identity}): {profile['prompt']}"
 
-        available_skills = ["Wave", "Point", "Yes", "No", "Idle"]
-        if self.arm_controller:
-            available_skills.extend(self.arm_controller.get_saved_skills())
-        skills_str = ", ".join([f"'{s}'" for s in available_skills])
-        custom_prompt += (
-            f"\n\nAVAILABLE PHYSICAL INTENTS: [{skills_str}]. "
-            "If the user asks you to perform one of these exact actions, you MUST set the 'intent' to that exact string. "
-            "Execute these intents IMMEDIATELY upon request, EVEN IF you do not see the target object in the Spatial Data (they are blind recorded trajectories). "
-            "You MUST output valid JSON ONLY, strictly containing 'dialogue' and 'intent' keys. Do NOT use markdown code formatting blocks."
-        )
+        custom_prompt += self._build_skills_prompt()
 
         messages = [{"role": "system", "content": self.system_prompt + custom_prompt}]
         messages.extend(self.chat_history)
@@ -194,11 +282,7 @@ class ReasoningBridge:
                     
                 self.chat_history.append({"role": "user", "content": user_text})
         
-                if self.arm_controller and intent.lower() != "idle":
-                    if getattr(self, "physical_interaction_enabled", False):
-                        self.arm_controller.execute_intent(intent)
-                    else:
-                        self.log_callback(f"[BRAIN] Prevented Arm Movement '{intent}' because Physical Interaction is OFF.")
+                self._dispatch_intent(intent)
                     
                 self.chat_history.append({"role": "assistant", "content": dialogue})
                 if len(self.chat_history) > 6:
@@ -275,16 +359,7 @@ class ReasoningBridge:
             if profile:
                 custom_prompt = f"\n\nPROFILE SPECIFIC: {profile['prompt']}"
 
-        available_skills = ["Wave", "Point", "Yes", "No", "Idle"]
-        if self.arm_controller:
-            available_skills.extend(self.arm_controller.get_saved_skills())
-        skills_str = ", ".join([f"'{s}'" for s in available_skills])
-        custom_prompt += (
-            f"\n\nAVAILABLE PHYSICAL INTENTS: [{skills_str}]. "
-            "If the user asks you to perform one of these exact actions, you MUST set the 'intent' to that exact string. "
-            "Execute these intents IMMEDIATELY upon request, EVEN IF you do not see the target object in the Spatial Data. "
-            "You MUST output valid JSON ONLY, strictly containing 'dialogue' and 'intent' keys. Do NOT use markdown code formatting blocks."
-        )
+        custom_prompt += self._build_skills_prompt()
 
         messages = [{"role": "system", "content": proactive_prompt + custom_prompt}]
         messages.extend(self.chat_history)
@@ -318,8 +393,7 @@ class ReasoningBridge:
                 if dialogue:
                     self.log_event_internal(f"[PROACTIVE] {dialogue}")
                     self.tts.speak(dialogue)
-                    if self.arm_controller and intent.lower() != "idle":
-                        self.arm_controller.execute_intent(intent)
+                    self._dispatch_intent(intent)
                         
                     # Save to history so robot remembers it spoke proactively
                     self.chat_history.append({"role": "assistant", "content": dialogue})

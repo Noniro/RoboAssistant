@@ -22,6 +22,8 @@ import customtkinter as ctk
 import cv2
 from PIL import Image, ImageTk
 import threading
+import time
+import platform
 
 try:
     from vision_module import VisionWorker
@@ -35,6 +37,60 @@ except ImportError as e:
 
 import json
 import os
+
+class ThreadedCamera:
+    """Helper to read camera frames in a background thread to prevent UI lag."""
+    def __init__(self, index, name="Camera", log_callback=None):
+        self.index = index
+        self.name = name
+        self.log_callback = log_callback
+        self.cap = None
+        self.frame = None
+        self.ret = False
+        self.running = False
+        self.lock = threading.Lock()
+        self.thread = None
+        self.backend = cv2.CAP_DSHOW if platform.system() == "Windows" else cv2.CAP_V4L2
+
+    def start(self):
+        if self.running: return True
+        self.cap = cv2.VideoCapture(self.index, self.backend)
+        if not self.cap.isOpened():
+            if self.log_callback: self.log_callback(f"[CAMERA] Failed to open {self.name} on index {self.index}")
+            return False
+        
+        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        
+        self.running = True
+        self.thread = threading.Thread(target=self._update_loop, daemon=True)
+        self.thread.start()
+        if self.log_callback: self.log_callback(f"[CAMERA] {self.name} started on index {self.index}")
+        return True
+
+    def _update_loop(self):
+        while self.running:
+            if self.cap:
+                ret, frame = self.cap.read()
+                with self.lock:
+                    self.ret = ret
+                    self.frame = frame
+            time.sleep(0.01) # Approx 100 FPS cap
+
+    def read(self):
+        with self.lock:
+            if self.frame is None: return False, None
+            return self.ret, self.frame.copy()
+
+    def release(self):
+        self.running = False
+        if self.thread: self.thread.join(timeout=1.0)
+        if self.cap:
+            self.cap.release()
+            self.cap = None
+        self.frame = None
+        self.ret = False
 
 class RobotSupervisorApp(ctk.CTk):
     def __init__(self):
@@ -68,8 +124,23 @@ class RobotSupervisorApp(ctk.CTk):
         self.arm_manual_btn = ctk.CTkButton(self.arm_cmds_frame, text="🕹 Manual Motor Control", fg_color="#0955b5", hover_color="#05338c", command=self.open_manual_motor_control)
         self.arm_manual_btn.pack(side="left", padx=5)
         
-        self.video_label = ctk.CTkLabel(self.camera_frame, text="")
+        # Camera feeds inside camera_frame: two panels stacked vertically
+        self.camera_feeds_frame = ctk.CTkFrame(self.camera_frame, fg_color="transparent")
+        self.camera_feeds_frame.pack(expand=True, fill="both")
+        
+        # Main camera
+        self.main_cam_frame = ctk.CTkFrame(self.camera_feeds_frame)
+        self.main_cam_frame.pack(side="top", expand=True, fill="both", padx=5, pady=5)
+        ctk.CTkLabel(self.main_cam_frame, text="📷 Main Camera", font=ctk.CTkFont(size=12, weight="bold")).pack(side="top", pady=2)
+        self.video_label = ctk.CTkLabel(self.main_cam_frame, text="")
         self.video_label.pack(expand=True, fill="both")
+        
+        # Gripper camera
+        self.gripper_cam_frame = ctk.CTkFrame(self.camera_feeds_frame)
+        self.gripper_cam_frame.pack(side="top", expand=True, fill="both", padx=5, pady=5)
+        ctk.CTkLabel(self.gripper_cam_frame, text="🤖 Gripper Camera", font=ctk.CTkFont(size=12, weight="bold")).pack(side="top", pady=2)
+        self.gripper_video_label = ctk.CTkLabel(self.gripper_cam_frame, text="")
+        self.gripper_video_label.pack(expand=True, fill="both")
 
         # Sidebar frame
         self.sidebar_frame = ctk.CTkFrame(self)
@@ -97,8 +168,12 @@ class RobotSupervisorApp(ctk.CTk):
         self.user_input.pack(side="left", expand=True, fill="x", padx=(0, 5))
         self.user_input.bind("<Return>", lambda e: self.send_chat())
         
+        self.mic_btn = ctk.CTkButton(self.chat_input_frame, text="🎤", width=30, fg_color="gray", command=self.toggle_mic)
+        self.mic_btn.pack(side="right", padx=(5, 5))
+        
         self.send_btn = ctk.CTkButton(self.chat_input_frame, text="Send", width=60, command=self.send_chat)
         self.send_btn.pack(side="right")
+        self.listening = False
 
         # Settings Toggle Button
         self.settings_btn = ctk.CTkButton(self.sidebar_frame, text="⚙ Hardware Settings", command=self.toggle_settings)
@@ -137,8 +212,13 @@ class RobotSupervisorApp(ctk.CTk):
         
         self.arm = ArmController(self.log_event)
         self.brain = ReasoningBridge(self.log_event, self.arm)
+        self.brain.ui_parent = self
         self.vision = VisionWorker(self.log_event, self.brain, event_callback=self.handle_vision_event)
         self.brain.vision_worker = self.vision # Link them back
+
+        # --- Auto-register trained VLA policies ---
+        # These are scanned at startup so both the UI and LLM brain can use them.
+        self._register_vla_policies()
 
         # Collapsible Settings Frame
         self.settings_visible = False
@@ -152,6 +232,13 @@ class RobotSupervisorApp(ctk.CTk):
         if self.settings.get("camera_name") in self.cam_names:
             self.cam_dropdown.set(self.settings["camera_name"])
         self.cam_dropdown.pack(pady=5, padx=10, fill="x")
+        
+        # Gripper Camera Selection
+        ctk.CTkLabel(self.settings_frame, text="Gripper Camera").pack(pady=(5,0))
+        self.gripper_cam_dropdown = ctk.CTkOptionMenu(self.settings_frame, values=self.cam_names, command=self.change_gripper_camera)
+        if self.settings.get("gripper_camera_name") in self.cam_names:
+            self.gripper_cam_dropdown.set(self.settings["gripper_camera_name"])
+        self.gripper_cam_dropdown.pack(pady=5, padx=10, fill="x")
         
         # Audio Selection (Placeholders)
         mics, speakers = list_audio_devices()
@@ -205,38 +292,91 @@ class RobotSupervisorApp(ctk.CTk):
         self.control_btn = ctk.CTkButton(self.sidebar_frame, text="Start System", command=self.toggle_system, fg_color="green")
         self.control_btn.pack(pady=20, padx=20, fill="x")
         
-        self.log_event("[SYSTEM] Initializing camera...")
-        self.cap = self._init_camera()
+        self.log_event("[SYSTEM] Initializing threaded cameras...")
+        self.cap_thread = self._init_camera_thread("camera_index", "Main Camera")
+        self.gripper_cap_thread = self._init_camera_thread("gripper_camera_index", "Gripper Camera")
         
         self.system_running = False
-        
         self.update_camera_feed()
 
-    def _init_camera(self):
-        # On Windows, DirectShow (CAP_DSHOW) is often much faster and more reliable
-        import platform
-        backend = cv2.CAP_DSHOW if platform.system() == "Windows" else cv2.CAP_V4L2
+    def _register_vla_policies(self):
+        """
+        Scans the outputs/train directory for trained checkpoints and auto-registers
+        them as VLA policies on both the arm controller and the brain.
+        """
+        import os
+        import glob
+        train_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs", "train")
+        if not os.path.exists(train_root):
+            return
         
-        # Try saved index first
-        saved_index = self.settings.get("camera_index")
-        indices_to_try = [saved_index] + [i for i in range(5) if i != saved_index] if saved_index is not None else range(5)
+        # Find all pretrained_model dirs
+        pattern = os.path.join(train_root, "**", "pretrained_model")
+        found = glob.glob(pattern, recursive=True)
+        
+        # Sort found models in reverse alphabetical order (latest timestamp first)
+        found.sort(reverse=True)
+        
+        registered_intents = {} # { intent_key: (step_count, policy_name) }
+        
+        for pretrained_path in found:
+            parts = pretrained_path.replace("\\", "/").split("/")
+            try:
+                chk_idx = parts.index("checkpoints")
+                run_name = parts[chk_idx - 1]
+                step_str = parts[chk_idx + 1]
+                step_int = int(step_str)
+                policy_name = f"{run_name}_step{step_str}"
+            except (ValueError, IndexError):
+                policy_name = os.path.basename(os.path.dirname(os.path.dirname(pretrained_path)))
+                step_int = 0
+            
+            self.arm.register_vla_policy(policy_name, pretrained_path)
+            
+            # Map clean intent key
+            if "finetune" in run_name.lower():
+                intent_key = "pick_and_place_optimized"
+            elif "pick_place" in run_name.lower():
+                intent_key = "pick_and_place_basic"
+            else:
+                intent_key = run_name.split("_", 1)[-1] if "_" in run_name else run_name
+                intent_key = intent_key.replace("-", "_").lower()
 
-        for index in indices_to_try:
-            cap = cv2.VideoCapture(index, backend)
-            if cap.isOpened():
-                # Microsoft LifeCam settings
-                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-                
-                ret, _ = cap.read()
-                if ret:
-                    self.log_event(f"[SYSTEM] Camera connected on index {index}.")
-                    return cap
-                cap.release()
-                
-        self.log_event("[SYSTEM] ERROR: No working camera found.")
-        return cv2.VideoCapture(0)
+            # Priority 1: Pick the LATEST run (highest timestamp - glob sort handled this)
+            # Priority 2: Pick the HIGHEST step count within that run
+            if intent_key not in registered_intents:
+                registered_intents[intent_key] = (step_int, policy_name)
+            else:
+                existing_step, _ = registered_intents[intent_key]
+                if step_int > existing_step:
+                    registered_intents[intent_key] = (step_int, policy_name)
+
+        # Finalize registration with the brain
+        for intent_key, (step, policy_name) in registered_intents.items():
+            self.brain.register_vla_intent(intent_key, policy_name)
+        
+        if found:
+            self.log_event(f"[VLA] Registered latest trained VLA policies. Primary: {registered_intents.get('pick_and_place_optimized', ('N/A', 'N/A'))[1]}")
+
+    def _init_camera_thread(self, index_key, name):
+        """Creates and starts a ThreadedCamera instance."""
+        saved_index = self.settings.get(index_key)
+        
+        if saved_index is None:
+            self.log_event(f"[SYSTEM] {name} not configured.")
+            return None
+
+        # Collision guard
+        if index_key == "gripper_camera_index":
+            main_idx = self.settings.get("camera_index")
+            if saved_index == main_idx:
+                self.log_event(f"[SYSTEM] ERROR: Gripper index {saved_index} conflict with Main. Skipping.")
+                return None
+
+        cam = ThreadedCamera(saved_index, name, self.log_event)
+        if cam.start():
+            return cam
+        return None
 
     def log_event(self, message):
         self.thought_log.configure(state="normal")
@@ -268,11 +408,15 @@ class RobotSupervisorApp(ctk.CTk):
 
     def save_settings(self):
         self.settings["camera_name"] = self.cam_dropdown.get()
+        if hasattr(self, 'gripper_cam_dropdown'):
+            self.settings["gripper_camera_name"] = self.gripper_cam_dropdown.get()
+            
         # Find camera index for name
         for c in self.cam_list:
-            if c["name"] == self.settings["camera_name"]:
+            if c["name"] == self.settings.get("camera_name"):
                 self.settings["camera_index"] = c["index"]
-                break
+            if c["name"] == self.settings.get("gripper_camera_name"):
+                self.settings["gripper_camera_index"] = c["index"]
         
         self.settings["mic_name"] = self.mic_dropdown.get()
         self.settings["spk_name"] = self.spk_dropdown.get()
@@ -302,24 +446,61 @@ class RobotSupervisorApp(ctk.CTk):
                 new_index = c["index"]
                 break
         
-        self.log_event(f"[SYSTEM] Switching to camera index {new_index}...")
+        # Guard: Prevent theft of gripper camera index
+        gripper_index = self.settings.get("gripper_camera_index")
+        if new_index == gripper_index and gripper_index is not None:
+             self.log_event("[SYSTEM] WARN: This camera is already in use by the Gripper. Select another.")
+             return
+
+        self.log_event(f"[SYSTEM] Switching main camera to index {new_index}...")
+        
+        # Save before opening so _init_camera sees updated state if needed
+        self.settings["camera_index"] = new_index
+        self.settings["camera_name"] = choice
         self.save_settings()
         
         # Release old
-        if self.cap:
-            self.cap.release()
+        if hasattr(self, 'cap_thread') and self.cap_thread:
+            self.cap_thread.release()
             
         # Init new
-        import platform
-        backend = cv2.CAP_DSHOW if platform.system() == "Windows" else cv2.CAP_V4L2
-        self.cap = cv2.VideoCapture(new_index, backend)
-        
-        if not self.cap.isOpened():
+        self.cap_thread = ThreadedCamera(new_index, "Main Camera", self.log_event)
+        if not self.cap_thread.start():
              self.log_event(f"[SYSTEM] ERROR: Could not open camera {new_index}.")
+             self.cap_thread = None
+
+    def change_gripper_camera(self, choice):
+        # Find index
+        new_index = 0
+        for c in self.cam_list:
+            if c["name"] == choice:
+                new_index = c["index"]
+                break
+        
+        # Guard: Prevent theft of main camera index
+        main_index = self.settings.get("camera_index")
+        if new_index == main_index:
+            self.log_event("[SYSTEM] WARN: This camera is already in use as the Main Camera. Select another.")
+            return
+        
+        self.log_event(f"[SYSTEM] Switching gripper camera to index {new_index}...")
+        
+        # Save before opening
+        self.settings["gripper_camera_index"] = new_index
+        self.settings["gripper_camera_name"] = choice
+        self.save_settings()
+        
+        # Release old
+        if hasattr(self, 'gripper_cap_thread') and self.gripper_cap_thread:
+            self.gripper_cap_thread.release()
+            
+        # Init new
+        self.gripper_cap_thread = ThreadedCamera(new_index, "Gripper Camera", self.log_event)
+        if not self.gripper_cap_thread.start():
+             self.log_event(f"[SYSTEM] ERROR: Could not open gripper camera {new_index}.")
+             self.gripper_cap_thread = None
         else:
-             self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+             self.log_event(f"[SYSTEM] Gripper camera switched successfully.")
 
     def change_voice(self, choice):
         self.save_settings()
@@ -383,16 +564,103 @@ class RobotSupervisorApp(ctk.CTk):
             self.after(0, self.append_to_chat, f"Brain: {dialogue}")
 
     def send_chat(self):
+        # Allow enabling the state just to extract text if it was disabled
+        was_disabled = str(self.user_input.cget("state")) == "disabled"
+        if was_disabled: self.user_input.configure(state="normal")
+            
         user_text = self.user_input.get()
         if not user_text.strip():
+            if was_disabled: self.user_input.configure(state="disabled")
             return
         
         self.user_input.delete(0, "end")
+        if was_disabled: self.user_input.configure(state="disabled")
+            
         self.append_to_chat(f"You: {user_text}")
         
         # Run inference in a thread to keep UI responsive
         identity = self.vision.last_identity
         threading.Thread(target=self._manual_chat_thread, args=(user_text, identity), daemon=True).start()
+
+    def toggle_mic(self):
+        if not self.listening:
+            self.listening = True
+            self.mic_btn.configure(fg_color="#b50909", hover_color="#8c0505", text="🛑")
+            self.user_input.delete(0, "end")
+            self.user_input.insert(0, "Listening...")
+            self.user_input.configure(state="disabled")
+            import threading
+            threading.Thread(target=self._listen_thread, daemon=True).start()
+        else:
+            self.listening = False
+            self.mic_btn.configure(fg_color="gray", text="🎤")
+            self.user_input.configure(state="normal")
+            self.user_input.delete(0, "end")
+            
+    def _listen_thread(self):
+        try:
+            import speech_recognition as sr
+            import pyaudio
+        except ImportError as e:
+            import sys
+            import os
+            paths = "\n".join(sys.path[:10])
+            self.after(0, lambda: self.log_event(f"[VOICE] Error: {e}\nEXE: {sys.executable}\nPaths:\n{paths}"))
+            self.after(0, self.toggle_mic)
+            return
+        except Exception as e:
+            self.after(0, lambda: self.log_event(f"[VOICE] Unexpected error: {e}"))
+            self.after(0, self.toggle_mic)
+            return
+            
+        recognizer = sr.Recognizer()
+        
+        # Try to find user's mic from hardware settings
+        mic_name = self.settings.get("mic_name")
+        mic_index = None
+        if mic_name and mic_name != "None":
+            try:
+                for idx, name in enumerate(sr.Microphone.list_microphone_names()):
+                    if mic_name == name:
+                        mic_index = idx
+                        break
+            except: pass
+                    
+        try:
+            with sr.Microphone(device_index=mic_index) as source:
+                self.after(0, lambda: self.log_event("[VOICE] Adjusting for background noise..."))
+                recognizer.adjust_for_ambient_noise(source, duration=0.5)
+                self.after(0, lambda: self.log_event("[VOICE] Active! Speak now."))
+                audio = recognizer.listen(source, timeout=10, phrase_time_limit=15)
+                
+                if not self.listening:
+                    return # Cancelled early
+                
+            self.after(0, lambda: self.user_input.configure(state="normal"))
+            self.after(0, lambda: self.user_input.delete(0, "end"))
+            self.after(0, lambda: self.user_input.insert(0, "Processing Speech..."))
+            self.after(0, lambda: self.user_input.configure(state="disabled"))
+            
+            text = recognizer.recognize_google(audio)
+            
+            if self.listening:
+                self.after(0, lambda: self.user_input.configure(state="normal"))
+                self.after(0, lambda: self.user_input.delete(0, "end"))
+                self.after(0, lambda: self.user_input.insert(0, text))
+                
+                # Auto-send
+                self.after(50, self.send_chat)
+                self.after(50, self.toggle_mic)
+                
+        except sr.WaitTimeoutError:
+            self.after(0, lambda: self.log_event("[VOICE] Timed out waiting for speech."))
+            self.after(0, self.toggle_mic)
+        except sr.UnknownValueError:
+            self.after(0, lambda: self.log_event("[VOICE] Could not understand audio."))
+            self.after(0, self.toggle_mic)
+        except Exception as e:
+            self.after(0, lambda: self.log_event(f"[VOICE] Error: {e}"))
+            self.after(0, self.toggle_mic)
 
     def _manual_chat_thread(self, text, identity):
         response = self.brain.manual_interact(text, identity=identity)
@@ -434,8 +702,26 @@ class RobotSupervisorApp(ctk.CTk):
             self.vision.stop()
 
     def update_camera_feed(self):
-        ret, frame = self.cap.read()
-        if ret:
+        # --- Main Camera Feed (Threaded) ---
+        ret, frame = False, None
+        if hasattr(self, 'cap_thread') and self.cap_thread:
+            ret, frame = self.cap_thread.read()
+        
+        # --- Gripper Camera Feed (Threaded) ---
+        gripper_frame = None
+        if hasattr(self, 'gripper_cap_thread') and self.gripper_cap_thread:
+            ret_g, frame_g = self.gripper_cap_thread.read()
+            if ret_g:
+                gripper_frame = frame_g
+        
+        # --- Security Mode: always detect on gripper for display; track only when enabled ---
+        if self.system_running and self.mode_manager.current_mode == "Security" and gripper_frame is not None:
+            mode_config = self.mode_manager.get_current_settings()
+            targets = mode_config.get("target_objects", []) if mode_config.get("enable_tracking", False) else []
+            self.vision.process_gripper_frame(gripper_frame, targets)
+                    
+        # --- Render main camera ---
+        if ret and frame is not None:
             # To prevent freezing, the vision module will process the frame asynchronously
             if self.system_running:
                 self.vision.process_frame(frame)
@@ -446,41 +732,84 @@ class RobotSupervisorApp(ctk.CTk):
                 objects = list(self.vision.object_metadata)
                 vlm_desc = self.vision.latest_scene_description
 
+            # DEBUG: Draw Index Overlay
+            if hasattr(self, 'cap_thread') and self.cap_thread:
+                cv2.putText(frame, f"Cam Index: {self.cap_thread.index}", (10, 470), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
             for (top, right, bottom, left), name in faces:
-                # Draw Box
                 cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 0), 2)
-                # Draw Label
                 cv2.rectangle(frame, (left, bottom - 35), (right, bottom), (0, 255, 0), cv2.FILLED)
                 font = cv2.FONT_HERSHEY_DUPLEX
                 cv2.putText(frame, name, (left + 6, bottom - 6), font, 0.8, (255, 255, 255), 1)
 
             for (box, label) in objects:
                 ymin, xmin, ymax, xmax = box
-                # YOLOv4-tiny returns actual pixel coordinates based on the frame size (640x480)
-                # No scaling out of 1000 needed anymore.
                 top, left, bottom, right = int(ymin), int(xmin), int(ymax), int(xmax)
-                
-                # Ensure within frame bounds
                 top, left = max(0, top), max(0, left)
                 bottom, right = min(480, bottom), min(640, right)
-                cv2.rectangle(frame, (left, top), (right, bottom), (0, 165, 255), 2) # Orange for objects
+                cv2.rectangle(frame, (left, top), (right, bottom), (0, 165, 255), 2)
                 cv2.putText(frame, label, (left + 5, top + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 2)
 
-            # Draw VLM Description Overlay
-            cv2.rectangle(frame, (0, 0), (640, 40), (0, 0, 0), -1) # Black bar at top
-            cv2.putText(frame, f"VLM Analysis: {vlm_desc}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+            # VLM overlay
+            cv2.rectangle(frame, (0, 0), (640, 32), (0, 0, 0), -1)
+            cv2.putText(frame, f"VLM: {vlm_desc}", (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
-            # Convert to CTK image for display
             img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            imgtk = ctk.CTkImage(light_image=img, size=(640, 480))
+            imgtk = ctk.CTkImage(light_image=img, size=(420, 315))
             self.video_label.configure(image=imgtk, text="")
             self.video_label.image = imgtk
 
-            # Update recognized person
             identity = self.vision.last_identity or "None"
             self.person_label.configure(text=f"Recognized: {identity}")
         else:
-            self.video_label.configure(text="CAMERA FEED OFFLINE\n(Check WSL Connection)", text_color="red")
+            self.video_label.configure(image=None, text="MAIN CAMERA OFFLINE", text_color="red")
+        
+        # --- Render gripper camera ---
+        if gripper_frame is not None:
+            # Draw YOLO detection boxes from gripper detections
+            with self.vision.lock:
+                gripper_objects = list(self.vision.gripper_object_metadata)
+            
+            frame_h, frame_w = gripper_frame.shape[:2]
+            
+            for (box, label) in gripper_objects:
+                ymin, xmin, ymax, xmax = box
+                top, left, bottom, right = int(ymin), int(xmin), int(ymax), int(xmax)
+                top, left = max(0, top), max(0, left)
+                bottom, right = min(frame_h, bottom), min(frame_w, right)
+                # Bright cyan for gripper targets
+                cv2.rectangle(gripper_frame, (left, top), (right, bottom), (0, 255, 255), 2)
+                cv2.putText(gripper_frame, f"TARGET: {label}", (left + 5, top + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
+                # Dot at center of detection
+                cx = int((left + right) / 2)
+                cy = int((top + bottom) / 2)
+                cv2.circle(gripper_frame, (cx, cy), 5, (0, 255, 255), -1)
+            
+            # DEBUG: Draw Index Overlay
+            if hasattr(self, 'gripper_cap_thread') and self.gripper_cap_thread:
+                cv2.putText(gripper_frame, f"Cam Index: {self.gripper_cap_thread.index}", (10, 470), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+            # Frame center crosshair (shows where arm will aim)
+            cx_frame, cy_frame = frame_w // 2, frame_h // 2
+            cv2.line(gripper_frame, (cx_frame - 20, cy_frame), (cx_frame + 20, cy_frame), (0, 255, 0), 1)
+            cv2.line(gripper_frame, (cx_frame, cy_frame - 20), (cx_frame, cy_frame + 20), (0, 255, 0), 1)
+            cv2.circle(gripper_frame, (cx_frame, cy_frame), 8, (0, 255, 0), 1)
+            
+            # Status label
+            tracking_active = (self.system_running and 
+                               self.mode_manager.current_mode == "Security" and 
+                               self.mode_manager.get_current_settings().get("enable_tracking", False))
+            status_text = "TURRET MODE ON" if tracking_active else "TURRET MODE OFF"
+            status_color = (0, 255, 0) if tracking_active else (0, 100, 200)
+            cv2.rectangle(gripper_frame, (0, 0), (150, 22), (0, 0, 0), -1)
+            cv2.putText(gripper_frame, status_text, (5, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.5, status_color, 1)
+            
+            gimg = Image.fromarray(cv2.cvtColor(gripper_frame, cv2.COLOR_BGR2RGB))
+            gimgtk = ctk.CTkImage(light_image=gimg, size=(420, 315))
+            self.gripper_video_label.configure(image=gimgtk, text="")
+            self.gripper_video_label.image = gimgtk
+        else:
+            self.gripper_video_label.configure(image=None, text="GRIPPER CAMERA OFFLINE\n(Select it in Hardware Settings)", text_color="orange")
             
         # 30 fps -> ~33 ms delay
         self.after(33, self.update_camera_feed)
@@ -489,13 +818,52 @@ class RobotSupervisorApp(ctk.CTk):
         ProfileManagerWindow(self)
 
     def open_arm_commands(self):
-        ArmCommandsWindow(self)
+        SkillStudioWindow(self)
 
     def open_manual_motor_control(self):
         ManualMotorControlWindow(self)
 
+    def suspend_for_external_script(self):
+        """Temporarily release hardware (cameras, serial ports) so an external script can use them."""
+        self.log_event("[SYSTEM] Suspending UI hardware locks for external script...")
+        self.system_running = False
+        self.vision.stop()
+        
+        if hasattr(self, 'cap_thread') and self.cap_thread:
+            self.cap_thread.release()
+            self.cap_thread = None
+        if hasattr(self, 'gripper_cap_thread') and self.gripper_cap_thread:
+            self.gripper_cap_thread.release()
+            self.gripper_cap_thread = None
+            
+        if hasattr(self, 'arm') and self.arm:
+            self.arm.disconnect_arms()
+            
+        self.log_event("[SYSTEM] Hardware successfully suspended.")
+
+    def resume_from_external_script(self):
+        """Re-acquire hardware and restart UI loops after an external script finishes."""
+        self.log_event("[SYSTEM] Resuming UI hardware locks...")
+        
+        # Ensure deep cleanup of previous arm object if requested
+        if hasattr(self, 'arm') and self.arm:
+            self.arm.connected = False
+            self.arm.robot = None
+            self.arm.leader_robot = None
+            # Force re-scan and re-init fully
+            self.arm.connect_arms()
+            
+        # Re-initialize camera threads
+        self.cap_thread = self._init_camera_thread("camera_index", "Main Camera")
+        self.gripper_cap_thread = self._init_camera_thread("gripper_camera_index", "Gripper Camera")
+        
+        self.system_running = True
+        self.vision.start()
+        self.log_event("[SYSTEM] Hardware successfully resumed.")
+
     def on_closing(self):
-        self.cap.release()
+        if hasattr(self, 'cap_thread') and self.cap_thread: self.cap_thread.release()
+        if hasattr(self, 'gripper_cap_thread') and self.gripper_cap_thread: self.gripper_cap_thread.release()
         self.vision.stop()
         self.destroy()
 
@@ -740,12 +1108,12 @@ class ModeSettingsWindow(ctk.CTkToplevel):
         self.parent.log_event(f"[SYSTEM] Saved updated configurations for {self.mode_name} Mode.")
         self.destroy()
 
-class ArmCommandsWindow(ctk.CTkToplevel):
+class SkillStudioWindow(ctk.CTkToplevel):
     def __init__(self, parent):
         super().__init__(parent)
         self.parent = parent
-        self.title("Arm Basic Commands & Skills")
-        self.geometry("350x650")
+        self.title("Skill Studio")
+        self.geometry("400x820")
         
         # Make it stay on top
         self.attributes("-topmost", True)
@@ -753,9 +1121,100 @@ class ArmCommandsWindow(ctk.CTkToplevel):
 
         self.grid_columnconfigure(0, weight=1)
 
-        ctk.CTkLabel(self, text="Motions & Skills", font=ctk.CTkFont(size=18, weight="bold")).pack(pady=10)
+        ctk.CTkLabel(self, text="Skill Studio", font=ctk.CTkFont(size=20, weight="bold")).pack(pady=10)
 
-        self.scroll_frame = ctk.CTkScrollableFrame(self)
+        # -------------------------------------------------------------------
+        # 0. Evaluate AI Brain Section
+        # -------------------------------------------------------------------
+        self.eval_frame = ctk.CTkFrame(self)
+        self.eval_frame.pack(fill="x", padx=10, pady=(0, 5))
+
+        ctk.CTkLabel(self.eval_frame, text="🧠 Evaluate AI Brain (VLA)", font=ctk.CTkFont(weight="bold")).pack(pady=5)
+
+        # Policy selector
+        self.eval_policy_frame = ctk.CTkFrame(self.eval_frame, fg_color="transparent")
+        self.eval_policy_frame.pack(fill="x", padx=10, pady=2)
+
+        vla_policies = list(self.parent.arm.get_vla_policies().keys())
+        if not vla_policies:
+            vla_policies = ["(No trained models found)"]
+
+        self.eval_policy_var = ctk.StringVar(value=vla_policies[-1])
+        self.eval_policy_dropdown = ctk.CTkOptionMenu(self.eval_policy_frame, values=vla_policies, variable=self.eval_policy_var)
+        self.eval_policy_dropdown.pack(side="left", expand=True, fill="x", padx=(0, 5))
+
+        self.refresh_eval_btn = ctk.CTkButton(
+            self.eval_policy_frame, text="🔄", width=30, 
+            command=self.refresh_vla_list
+        )
+        self.refresh_eval_btn.pack(side="right")
+
+        eval_settings_frame = ctk.CTkFrame(self.eval_frame, fg_color="transparent")
+        eval_settings_frame.pack(fill="x", padx=10, pady=2)
+
+        ctk.CTkLabel(eval_settings_frame, text="Episodes:", font=ctk.CTkFont(size=10)).pack(side="left", padx=2)
+        self.eval_num_episodes_var = ctk.StringVar(value="1")
+        ctk.CTkEntry(eval_settings_frame, textvariable=self.eval_num_episodes_var, width=40).pack(side="left", padx=2)
+
+        ctk.CTkLabel(eval_settings_frame, text="Time (s):", font=ctk.CTkFont(size=10)).pack(side="left", padx=2)
+        self.eval_time_var = ctk.StringVar(value="60")
+        ctk.CTkEntry(eval_settings_frame, textvariable=self.eval_time_var, width=40).pack(side="left", padx=2)
+
+        self.eval_btn = ctk.CTkButton(
+            self.eval_frame,
+            text="▶ Run Autonomous Eval",
+            fg_color="#1a6b3c", hover_color="#0f4526",
+            command=self.run_eval
+        )
+        self.eval_btn.pack(pady=5, padx=10, fill="x")
+
+        # -------------------------------------------------------------------
+        # 1. Full VLA AI Training Section
+        # -------------------------------------------------------------------
+        self.ai_frame = ctk.CTkFrame(self)
+        self.ai_frame.pack(fill="x", padx=10, pady=(5, 10))
+        
+        ctk.CTkLabel(self.ai_frame, text="Full VLA AI Training (Dual Camera)", font=ctk.CTkFont(weight="bold")).pack(pady=5)
+        
+        self.repo_id_var = ctk.StringVar(value="local/new_skill")
+        self.repo_entry = ctk.CTkEntry(self.ai_frame, textvariable=self.repo_id_var, placeholder_text="local/skill_name")
+        self.repo_entry.pack(pady=5, padx=10, fill="x")
+        
+        self.resume_ai_var = ctk.BooleanVar(value=False)
+        self.resume_ai_cb = ctk.CTkCheckBox(self.ai_frame, text="Resume existing dataset", variable=self.resume_ai_var)
+        self.resume_ai_cb.pack(pady=2, padx=10, anchor="w")
+
+        # --- Manual Control Settings ---
+        self.manual_mode_var = ctk.BooleanVar(value=True) # Default to True as per user preference
+        self.manual_cb = ctk.CTkCheckBox(self.ai_frame, text="Manual Trigger Mode (Use 'r')", variable=self.manual_mode_var)
+        self.manual_cb.pack(pady=2, padx=10, anchor="w")
+
+        self.visualize_ai_var = ctk.BooleanVar(value=False)
+        self.visualize_ai_cb = ctk.CTkCheckBox(self.ai_frame, text="Live Visualization (Rerun)", variable=self.visualize_ai_var)
+        self.visualize_ai_cb.pack(pady=2, padx=10, anchor="w")
+
+        self.settings_frame = ctk.CTkFrame(self.ai_frame, fg_color="transparent")
+        self.settings_frame.pack(fill="x", padx=10, pady=2)
+
+        ctk.CTkLabel(self.settings_frame, text="Episodes:", font=ctk.CTkFont(size=10)).pack(side="left", padx=2)
+        self.num_episodes_var = ctk.StringVar(value="50")
+        self.num_episodes_entry = ctk.CTkEntry(self.settings_frame, textvariable=self.num_episodes_var, width=40)
+        self.num_episodes_entry.pack(side="left", padx=2)
+
+        ctk.CTkLabel(self.settings_frame, text="Time (s):", font=ctk.CTkFont(size=10)).pack(side="left", padx=2)
+        self.ep_time_var = ctk.StringVar(value="60")
+        self.ep_time_entry = ctk.CTkEntry(self.settings_frame, textvariable=self.ep_time_var, width=40)
+        self.ep_time_entry.pack(side="left", padx=2)
+
+        self.ai_record_btn = ctk.CTkButton(self.ai_frame, text="🎥 Record AI Episode (LeRobot)", fg_color="#6b058c", hover_color="#4d0366", command=self.toggle_ai_recording)
+        self.ai_record_btn.pack(pady=5, padx=10, fill="x")
+
+        # -------------------------------------------------------------------
+        # 2. Instant Kinematic Replay Section
+        # -------------------------------------------------------------------
+        ctk.CTkLabel(self, text="Instant Kinematic Replay (Blind)", font=ctk.CTkFont(size=14, weight="bold")).pack(pady=5)
+        
+        self.scroll_frame = ctk.CTkScrollableFrame(self, height=200)
         self.scroll_frame.pack(expand=True, fill="both", padx=10, pady=5)
         
         self.refresh_skill_list()
@@ -771,7 +1230,7 @@ class ArmCommandsWindow(ctk.CTkToplevel):
         self.record_frame = ctk.CTkFrame(self)
         self.record_frame.pack(fill="x", padx=10, pady=5)
         
-        ctk.CTkLabel(self.record_frame, text="Create New Skill (Leader Arm)", font=ctk.CTkFont(weight="bold")).pack(pady=5)
+        ctk.CTkLabel(self.record_frame, text="Create Base Skill (Leader Arm)", font=ctk.CTkFont(weight="bold")).pack(pady=5)
         
         self.skill_name_var = ctk.StringVar()
         self.skill_entry = ctk.CTkEntry(self.record_frame, textvariable=self.skill_name_var, placeholder_text="Skill Name...")
@@ -781,6 +1240,141 @@ class ArmCommandsWindow(ctk.CTkToplevel):
         self.record_btn.pack(pady=5, padx=10, fill="x")
 
         ctk.CTkButton(self, text="Close", fg_color="gray", command=self.destroy).pack(pady=10, side="bottom")
+
+    def run_eval(self):
+        policy_name = self.eval_policy_var.get()
+        if not policy_name or policy_name.startswith("("):
+            self.parent.log_event("[VLA-EVAL] No valid policy selected. Try clicking the Refresh 🔄 button.")
+            return
+
+        try:
+            num_episodes = int(self.eval_num_episodes_var.get())
+            episode_time = int(self.eval_time_var.get())
+        except ValueError:
+            self.parent.log_event("[VLA-EVAL] Invalid episode count or time. Please enter integers.")
+            return
+
+        # Suspend hardware so the subprocess can own the COM ports and cameras
+        self.parent.suspend_for_external_script()
+
+        # Disable buttons while running
+        self.eval_btn.configure(state="disabled", text="Running... (Autonomous)")
+        self.ai_record_btn.configure(state="disabled")
+        self.teleop_btn.configure(state="disabled")
+        self.record_btn.configure(state="disabled")
+
+        self.parent.log_event(f"[VLA-EVAL] Launching autonomous eval: {policy_name} x{num_episodes} episodes @ {episode_time}s each")
+
+        import threading
+        threading.Thread(
+            target=self._monitor_eval,
+            args=(policy_name, num_episodes, episode_time),
+            daemon=True
+        ).start()
+
+    def _monitor_eval(self, policy_name, num_episodes, episode_time):
+        process = self.parent.arm.run_vla_intent(
+            policy_name=policy_name,
+            episode_time=episode_time,
+            num_episodes=num_episodes,
+            camera_settings=self.parent.settings
+        )
+
+        if process:
+            process.wait()
+            self.parent.log_event(f"[VLA-EVAL] Autonomous eval session ended for '{policy_name}'.")
+        else:
+            self.parent.log_event(f"[VLA-EVAL] Failed to launch eval for '{policy_name}'.")
+
+        self.after(0, self._resume_ui_after_eval)
+
+    def _resume_ui_after_eval(self):
+        self.parent.resume_from_external_script()
+        if self.winfo_exists():
+            self.eval_btn.configure(state="normal", text="▶ Run Autonomous Eval")
+            self.ai_record_btn.configure(state="normal")
+            self.teleop_btn.configure(state="normal")
+            self.record_btn.configure(state="normal")
+
+    def refresh_vla_list(self):
+        """Re-scans the filesystem for checkpoints and updates the dropdown."""
+        self.parent._register_vla_policies()
+        vla_data = self.parent.arm.get_vla_policies()
+        vla_policies = list(vla_data.keys())
+        
+        if not vla_policies:
+            vla_policies = ["(No trained models found)"]
+            
+        self.eval_policy_dropdown.configure(values=vla_policies)
+        self.eval_policy_var.set(vla_policies[-1])
+        self.parent.log_event(f"[VLA] UI updated: {len(vla_data)} policies available.")
+
+    def toggle_ai_recording(self):
+        repo_name = self.repo_id_var.get().strip().replace(" ", "-")
+        if not repo_name:
+            self.parent.log_event("[GUI-ARM] Please enter a dataset name.")
+            return
+        
+        resume = self.resume_ai_var.get()
+        manual_mode = self.manual_mode_var.get()
+        try:
+            num_episodes = int(self.num_episodes_var.get())
+            episode_time = int(self.ep_time_var.get())
+        except ValueError:
+            self.parent.log_event("[GUI-ARM] Invalid numbers for episodes or time.")
+            return
+
+        # 1. Suspend GUI Locks
+        self.parent.suspend_for_external_script()
+        
+        # 2. Update UI
+        self.ai_record_btn.configure(state="disabled", text="Recording... (See LeRobot Window)")
+        self.teleop_btn.configure(state="disabled")
+        self.record_btn.configure(state="disabled")
+        
+        # 3. Launch Subprocess
+        import threading
+        # We start this in a thread so the UI can continue responding while LeRobot blocks
+        num_episodes = int(self.num_episodes_var.get())
+        episode_time = int(self.ep_time_var.get())
+        manual_mode = self.manual_mode_var.get()
+        visualize = self.visualize_ai_var.get()
+
+        # Start monitoring thread
+        self.ai_record_thread = threading.Thread(
+            target=self._monitor_ai_recording,
+            args=(repo_name, resume, num_episodes, episode_time, manual_mode, visualize),
+            daemon=True
+        )
+        self.ai_record_thread.start()
+        
+    def _monitor_ai_recording(self, repo_name, resume, num_episodes, episode_time, manual_mode, visualize):
+        process = self.parent.arm.start_ai_recording(
+            repo_id=repo_name, 
+            resume=resume,
+            num_episodes=num_episodes,
+            episode_time=episode_time,
+            manual_mode=manual_mode
+        )
+        
+        if process:
+            # Block this background thread until LeRobot window is closed
+            process.wait() 
+            self.parent.log_event("[VLA-DATASET] LeRobot recording session ended.")
+        else:
+            self.parent.log_event("[VLA-DATASET] Failed to launch LeRobot recording session.")
+            
+        # Safely trigger resume logic on the main thread
+        self.after(0, self._resume_ui_after_ai)
+        
+    def _resume_ui_after_ai(self):
+        # 1. Resume GUI Locks
+        self.parent.resume_from_external_script()
+        
+        # 2. Restore UI buttons
+        self.ai_record_btn.configure(state="normal", text="🎥 Record AI Episode (LeRobot)")
+        self.teleop_btn.configure(state="normal")
+        self.record_btn.configure(state="normal")
 
     def refresh_skill_list(self):
         for widget in self.scroll_frame.winfo_children():

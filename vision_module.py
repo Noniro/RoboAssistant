@@ -27,12 +27,20 @@ class VisionWorker:
         self.event_callback = event_callback
         self.running = False
         self.current_frame = None
+        self.current_gripper_frame = None
+        self.target_objects_to_track = []
         self.last_identity = "None"
         self._identity_timeout = 0
         self.face_metadata = [] # List of (location, name)
-        self.object_metadata = [] # List of (box, label)
+        self.object_metadata = [] # List of (box, label) for main camera
+        self.gripper_object_metadata = [] # List of (box, label) for gripper camera
         self.latest_scene_description = "Waiting for analysis..."
         self.lock = threading.RLock()
+        
+        # Tracking smoothing (EMA)
+        self.last_error_x = 0.0
+        self.last_error_y = 0.0
+        self.ema_alpha = 0.6 # Faster response (0.1 = smooth/slow, 0.9 = fast/jittery)
         
         # LM Studio / Local API Settings
         self.api_url = "http://localhost:1234/v1/chat/completions" # Default LM Studio Port
@@ -134,21 +142,110 @@ class VisionWorker:
         with self.lock:
             self.current_frame = frame.copy()
 
+    def process_gripper_frame(self, frame, targets):
+        with self.lock:
+            self.current_gripper_frame = frame.copy()
+            self.target_objects_to_track = targets
+
     def _worker_loop(self):
         self.log_callback("[VISION] Background worker started. Waiting for motion/faces...")
         while self.running:
             frame_to_process = None
+            gripper_frame_to_process = None
+            targets = []
+            
             with self.lock:
                 if self.current_frame is not None:
                     frame_to_process = self.current_frame
                     self.current_frame = None
+                if self.current_gripper_frame is not None:
+                    gripper_frame_to_process = self.current_gripper_frame
+                    self.current_gripper_frame = None
+                    targets = tuple(self.target_objects_to_track)
                     
             if frame_to_process is not None:
                 self._detect_triggers(frame_to_process)
-                time.sleep(0.03) # Yield significantly to main UI thread (stops camera jitter)
+                
+            if gripper_frame_to_process is not None:
+                self._track_gripper_objects(gripper_frame_to_process, targets)
+                
+            if frame_to_process is not None or gripper_frame_to_process is not None:
+                time.sleep(0.02) # Yield significantly to main UI thread (stops camera jitter)
             else:
                 time.sleep(0.01) # Allow thread to yield but run at high FPS
 
+    def _track_gripper_objects(self, frame, targets):
+        """Detect all objects in gripper frame. Store all for display, track only objects in 'targets'."""
+        if self.net is None:
+            with self.lock:
+                self.gripper_object_metadata = []
+            return
+            
+        height, width = frame.shape[:2]
+        blob = cv2.dnn.blobFromImage(frame, 1/255.0, (320, 320), swapRB=True, crop=False)
+        self.net.setInput(blob)
+        outs = self.net.forward(self.output_layers)
+        
+        class_ids = []
+        confidences = []
+        boxes = []
+        
+        for out in outs:
+            for detection in out:
+                scores = detection[5:]
+                class_id = np.argmax(scores)
+                confidence = scores[class_id]
+                if confidence > 0.4:
+                    center_x = int(detection[0] * width)
+                    center_y = int(detection[1] * height)
+                    w = int(detection[2] * width)
+                    h = int(detection[3] * height)
+                    x = int(center_x - w / 2)
+                    y = int(center_y - h / 2)
+                    boxes.append([x, y, w, h])
+                    confidences.append(float(confidence))
+                    class_ids.append(class_id)
+                        
+        indices = cv2.dnn.NMSBoxes(boxes, confidences, 0.4, 0.3)
+        
+        # Store ALL detected objects for display on the gripper feed
+        detected = []
+        if len(indices) > 0:
+            for i in indices.flatten():
+                x, y, w, h = boxes[i]
+                label = self.coco_classes[class_ids[i]]
+                detected.append(((int(y), int(x), int(y + h), int(x + w)), label))
+        
+        with self.lock:
+            self.gripper_object_metadata = detected
+            
+        # Use ONLY target-matching detections to drive turret movement
+        arm_ctrl = getattr(self.brain, 'arm_controller', None)
+        if arm_ctrl and hasattr(arm_ctrl, 'adjust_tracking') and len(indices) > 0:
+            target_matches = [(boxes[i], i) for i in indices.flatten()
+                              if self.coco_classes[class_ids[i]] in targets]
+            
+            if target_matches:
+                best_box, _ = target_matches[0]
+                x, y, w, h = best_box
+                center_x = x + w / 2
+                center_y = y + h / 2
+                error_x = center_x - (width / 2)
+                error_y = center_y - (height / 2)
+                
+                # Apply EMA smoothing to the errors to reduce YOLO jitter
+                self.last_error_x = (self.ema_alpha * error_x) + ((1.0 - self.ema_alpha) * self.last_error_x)
+                self.last_error_y = (self.ema_alpha * error_y) + ((1.0 - self.ema_alpha) * self.last_error_y)
+                
+                arm_ctrl.adjust_tracking(self.last_error_x, self.last_error_y, width, height)
+            else:
+                # Target lost - reset PID to prevent windup drift
+                if hasattr(arm_ctrl, 'reset_pids'):
+                    arm_ctrl.reset_pids()
+        elif arm_ctrl and hasattr(arm_ctrl, 'reset_pids'):
+            # No detections at all - reset PID
+            arm_ctrl.reset_pids()
+                
     def _detect_triggers(self, frame):
         # 1. ALWAYS perform Face Recognition for UI Overlays
         metadata = []
