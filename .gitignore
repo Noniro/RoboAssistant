@@ -1,22 +1,35 @@
-# Python
-venv/
+# Byte-compiled / optimized / DLL files
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*$py.class
 
-# Large Binary Files (RoboAssistant Models)
-*.weights
-*.tflite
-*.prototxt
-*.zip
+# Environments
+.env
+.venv
+venv/
+ENV/
+env/
+python_env/
 
-# Secret / User Specific Data
-config.json
-profiles.json
-test_profiles.json
+# Training Outputs (Very Large)
+outputs/
+.cache/
 
-# IDEs
+# Local Logs & Reports
+*.log
+*.txt
+camera_report.txt
+inference_log.txt
+record_log.txt
+
+# Editor / IDE Config
 .vscode/
 .idea/
-.DS_Store
+*.swp
+*.swo
+
+# Project Fallbacks
+test_eval.py
+test_glob.py
+debug_eval.py
+check_cameras.py
