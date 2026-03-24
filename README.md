@@ -15,13 +15,16 @@ A robotic control system for high-level reasoning and precision execution. RoboA
 *High-speed movements learned from demonstrations using transformer-based action chunking.*
 
 ![ACT Demonstration](docs/assets/act_demo.gif)
-> *[Optional: Add your ACT recording here: `docs/assets/act_demo.gif`]*
+
+https://github.com/user-attachments/assets/25e34e01-4c24-4d4b-9b08-f5cf9a4c8e92
+
+
 
 ### Real-Time Reasoning (OpenVLA)
 *The robot interprets visual context and natural language to plan maneuvers.*
 
 ![OpenVLA Reasoning](docs/assets/vla_inference.gif)
-> *[Optional: Add your OpenVLA recording here: `docs/assets/vla_inference.gif`]*
+> *[soon]*
 
 ---
 
