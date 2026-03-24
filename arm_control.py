@@ -1,5 +1,9 @@
 import time
 import torch
+import yaml
+import json
+import numpy as np
+from pathlib import Path
 from lerobot.policies.factory import make_policy
 
 class PIDController:
@@ -32,6 +36,41 @@ class PIDController:
         self.integral = 0.0
         self.last_error = 0.0
 
+class VLAWorkerWrapper:
+    """Mimics a subprocess.Popen object for the warm worker."""
+    def __init__(self, process, log_callback):
+        self.process = process
+        self.log_callback = log_callback
+        self.returncode = 0
+
+    def wait(self, timeout=None):
+        """Waits for the 'FINISHED' signal from the worker's stdout."""
+        self.log_callback("[VLA-WORKER] Monitoring for task completion...")
+        while True:
+            line = self.process.stdout.readline()
+            if not line:
+                self.returncode = 1
+                break
+            if "FINISHED" in line:
+                self.returncode = 0
+                break
+            if "ERROR" in line or "Traceback" in line:
+                self.log_callback(f"[VLA-WORKER] Task Error: {line.strip()}")
+                self.returncode = 1
+                break
+        return self.returncode
+
+    def poll(self):
+        return self.process.poll()
+
+    def kill(self):
+        # We don't kill the actual worker process, we just send STOP
+        try:
+            self.process.stdin.write("STOP\n")
+            self.process.stdin.flush()
+        except:
+            pass
+
 class ArmController:
     def __init__(self, log_callback):
         self.log_callback = log_callback
@@ -51,6 +90,10 @@ class ArmController:
         
         # VLA Policy Registry: { display_name: checkpoint_path }
         self.vla_policies = {}
+        
+        # VLA Worker Process Management
+        self.vla_worker_process = None
+        self.vla_worker_ready = False
         
         self.connect_arms()
         
@@ -166,6 +209,128 @@ class ArmController:
         time.sleep(0.5) 
         
         self.log_callback("[VLA-ARM] Arms successfully disconnected and port handles freed.")
+        
+    def start_vla_worker(self, policy_name):
+        """Launches the resident vla_worker.py process for a specific policy."""
+        if self.vla_worker_process and self.vla_worker_ready:
+            self.log_callback(f"[VLA-WORKER] Worker already running.")
+            return True
+
+        checkpoint_path = self.vla_policies.get(policy_name)
+        if not checkpoint_path:
+            self.log_callback(f"[VLA-WORKER] ERROR: Policy '{policy_name}' not found.")
+            return False
+
+        self.log_callback(f"[VLA-WORKER] Starting resident worker for '{policy_name}'...")
+        
+        import subprocess
+        import sys
+        import os
+        import tempfile
+        import yaml
+        from pathlib import Path
+
+        # 1. Ensure arms are disconnected so worker can take ports
+        if self.connected:
+            self.disconnect_arms()
+
+        lerobot_python = r"C:\Users\Noniro\miniconda3\envs\lerobot\python.exe"
+        lerobot_src_dir = r"C:\Users\Noniro\lerobot"
+        lerobot_cache_dir = Path.home() / ".cache" / "huggingface" / "lerobot" / "calibration"
+        
+        config_data = {
+            "robot": {
+                "type": "so101_follower",
+                "port": self.target_port or "COM4",
+                "id": "so_arm_101",
+                "calibration_dir": str(lerobot_cache_dir / "robots" / "so101_follower"),
+                "cameras": {
+                    "cam_high": {"type": "opencv", "index_or_path": 0, "width": 640, "height": 480, "fps": 30},
+                    "cam_wrist": {"type": "opencv", "index_or_path": 2, "width": 640, "height": 480, "fps": 30},
+                    "cam_side": {"type": "opencv", "index_or_path": 1, "width": 640, "height": 480, "fps": 30}
+                }
+            },
+            "dataset": {
+                "repo_id": f"local/worker_{policy_name}",
+                "rename_map": {
+                    "cam_high": "images.cam_high",
+                    "cam_side": "images.cam_side",
+                    "cam_wrist": "images.cam_wrist"
+                }
+            }
+        }
+        
+        fd, temp_config_path = tempfile.mkstemp(suffix=".yaml", text=True)
+        with os.fdopen(fd, 'w') as f:
+            yaml.dump(config_data, f, default_flow_style=False)
+
+        worker_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vla_worker.py")
+        cmd = [lerobot_python, worker_script, temp_config_path, checkpoint_path]
+        
+        env = os.environ.copy()
+        env["PYTHONPATH"] = lerobot_src_dir + (os.pathsep + env["PYTHONPATH"] if "PYTHONPATH" in env else "")
+
+        try:
+            self.vla_worker_process = subprocess.Popen(
+                cmd, env=env,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+            
+            # Wait for READY signal
+            self.log_callback("[VLA-WORKER] Waiting for model to load (Cold start)...")
+            start_t = time.time()
+            while time.time() - start_t < 40: # 40s timeout for safety
+                line = self.vla_worker_process.stdout.readline()
+                if not line: break
+                if "READY" in line:
+                    self.vla_worker_ready = True
+                    self.log_callback("[VLA-WORKER] Worker is READY and ACTIVE (Model Warm).")
+                    break
+                if "ERROR" in line or "Traceback" in line:
+                    self.log_callback(f"[VLA-WORKER] Init Error: {line.strip()}")
+            
+            if not self.vla_worker_ready:
+                self.log_callback("[VLA-WORKER] Failed to reach READY state.")
+                return False
+                
+            return True
+        except Exception as e:
+            self.log_callback(f"[VLA-WORKER] Spawn Error: {e}")
+            return False
+
+    def stop_vla_worker(self):
+        if self.vla_worker_process:
+            self.log_callback("[VLA-WORKER] Shutting down resident worker...")
+            try:
+                self.vla_worker_process.stdin.write("QUIT\n")
+                self.vla_worker_process.stdin.flush()
+                self.vla_worker_process.wait(timeout=5)
+            except:
+                self.vla_worker_process.kill()
+            self.vla_worker_process = None
+            self.vla_worker_ready = False
+            self.log_callback("[VLA-WORKER] Worker stopped.")
+
+    def run_vla_intent_warm(self, task_name, duration=60):
+        """Sends a task command to the warm resident worker."""
+        if not self.vla_worker_ready or not self.vla_worker_process:
+            self.log_callback("[VLA-WORKER] ERROR: Worker not ready. Falling back to cold start...")
+            return None 
+            
+        self.log_callback(f"[VLA-WORKER] 🚀 Sending warm trigger: '{task_name}' ({duration}s)")
+        try:
+            self.vla_worker_process.stdin.write(f"START {duration} {task_name}\n")
+            self.vla_worker_process.stdin.flush()
+            # Return our wrapper so .wait() works as expected in brain_module
+            return VLAWorkerWrapper(self.vla_worker_process, self.log_callback)
+        except Exception as e:
+            self.log_callback(f"[VLA-WORKER] Command Error: {e}")
+            return None
 
     # Pi-Zero VLA initialization (kept separate from physical connection)
     def init_policy(self):
@@ -792,13 +957,18 @@ input("Press Enter to close this window...")
     def run_vla_intent(self, policy_name, episode_time=60, num_episodes=1, camera_settings=None):
         """
         Trigger a named VLA policy for autonomous inference.
-        Called by the UI button or the LLM brain when it determines a VLA intent.
+        Uses the warm worker if available, otherwise falls back to cold start.
         """
+        # --- NEW: Warm Worker Path ---
+        if self.vla_worker_process and self.vla_worker_ready:
+            return self.run_vla_intent_warm(policy_name, duration=episode_time)
+            
+        # --- OLD: Cold Start Path ---
         checkpoint_path = self.vla_policies.get(policy_name)
         if not checkpoint_path:
             self.log_callback(f"[VLA-ARM] ERROR: VLA policy '{policy_name}' not registered.")
             return None
-        self.log_callback(f"[VLA-ARM] Triggering VLA inference for policy: '{policy_name}'")
+        self.log_callback(f"[VLA-ARM] Triggering VLA inference (Cold Start) for policy: '{policy_name}'")
         return self.run_ai_inference(
             repo_id=policy_name,
             checkpoint_path=checkpoint_path,

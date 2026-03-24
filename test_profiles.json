@@ -1,0 +1,15 @@
+{
+    "Yuval": {
+        "name": "Yuval",
+        "prompt": "You are greeting Yuval, your creator. Be extremely helpful, respectful, and slightly informal.",
+        "encoding": null
+    },
+    "Test": {
+        "name": "Test",
+        "prompt": "Test",
+        "encoding": [
+            1.0,
+            2.0
+        ]
+    }
+}

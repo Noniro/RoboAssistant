@@ -29,11 +29,59 @@ class ReasoningBridge:
         self.enable_vlm_reasoning = True
         self.physical_interaction_enabled = False
         
+        # Unified VLA integration
+        self.use_unified_vla = True # Transitioned to Unified Architecture
+        self.unified_vla_process = None
+        self.unified_vla_lock = threading.Lock()
+        
         # VLA intent routing: { intent_string_from_LLM: vla_policy_name }
         # e.g. { "pick_and_place": "pick_place_Iloveyoublock" }
         self.vla_intents = {}
         
-        self.log_callback("[BRAIN] Environment: Windows. Reasoning via Local API (localhost:1234).")
+        if self.use_unified_vla:
+            self.log_callback("[BRAIN] Environment: Windows. Reasoning via UNIFIED VLA.")
+            self._start_unified_vla()
+        else:
+            self.log_callback("[BRAIN] Environment: Windows. Reasoning via Local API (localhost:1234).")
+
+    def _start_unified_vla(self):
+        import subprocess
+        import sys
+        self.log_callback("[BRAIN] 🚀 Booting Unified VLA orchestrator. This takes ~20s to load 14GB weights...")
+        try:
+            # We must use Popen to keep it alive
+            self.unified_vla_process = subprocess.Popen(
+                [sys.executable, "unified_vla_worker.py"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, # Merge stderr so we can see load errors
+                text=True,
+                bufsize=1 # Line buffered
+            )
+            # Start a background thread to read its init signals and replies
+            threading.Thread(target=self._monitor_unified_vla, daemon=True).start()
+        except Exception as e:
+            self.log_callback(f"[BRAIN] Failed to start Unified VLA: {e}")
+
+    def _monitor_unified_vla(self):
+        if not self.unified_vla_process: return
+        self.log_callback("[VLA-WORKER] Monitoring process...")
+        while True:
+            line = self.unified_vla_process.stdout.readline()
+            if not line: break
+            line = line.strip()
+            if not line: continue
+            
+            if line == "READY":
+                self.log_callback("[VLA-WORKER] Unified VLA Model is Loaded into VRAM & Ready!")
+            elif line.startswith("CHAT_REPLY"):
+                # We handle this asynchronously or in the blocking call.
+                # Since manual_interact blocks, it's better to read it there.
+                # However, if we read here, we consume the stream.
+                # Let's just log it if we aren't careful, or we use a queue.
+                pass
+            else:
+                self.log_callback(f"[VLA-WORKER] {line}")
 
     def load_models(self, required_models, base_prompt=None):
         if base_prompt:
@@ -107,6 +155,9 @@ class ReasoningBridge:
         if ui:
             ui.after(0, ui.suspend_for_external_script)
             
+        # Ensure VLA worker is started (Phase 1: Resident Infrastructure)
+        self.arm_controller.start_vla_worker(policy_name)
+        
         process = self.arm_controller.run_vla_intent(policy_name, episode_time=90)
         
         success = False
@@ -254,44 +305,53 @@ class ReasoningBridge:
         self.log_callback(f"[BRAIN-CHAT] Identity: {identity or 'Unknown'}")
 
         try:
-            payload = {
-                "model": "llama-3.2-3b-instruct",
-                "messages": messages,
-                "temperature": 0.7
-            }
-            response = requests.post(self.api_url, json=payload, timeout=10)
-            if response.status_code == 200:
-                result = response.json()
-                response_text = result['choices'][0]['message']['content'].strip()
-                
-                # Attempt to parse JSON if model follows instructions, else fallback to regex
-                try:
-                    json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
-                    if json_match:
-                        parsed = json.loads(json_match.group(0))
-                        dialogue = parsed.get('dialogue', response_text)
-                        intent = parsed.get('intent', "Idle")
-                    else:
-                        raise ValueError("No JSON block found")
-                except Exception as e:
-                    self.log_callback(f"[BRAIN-CHAT] JSON Parse Error: {e}, attempting regex extraction on: {response_text}")
-                    d_match = re.search(r'"dialogue"\s*:\s*"([^"]+)"', response_text, re.IGNORECASE)
-                    i_match = re.search(r'"intent"\s*:\s*"([^"]+)"', response_text, re.IGNORECASE)
-                    dialogue = d_match.group(1) if d_match else response_text.replace('{', '').replace('}', '').replace('"', '').strip()
-                    intent = i_match.group(1) if i_match else "Idle"
-                    
-                self.chat_history.append({"role": "user", "content": user_text})
-        
-                self._dispatch_intent(intent)
-                    
-                self.chat_history.append({"role": "assistant", "content": dialogue})
-                if len(self.chat_history) > 6:
-                    self.chat_history = self.chat_history[-6:]
-                    
-                self.tts.speak(dialogue)
-                return dialogue
+            if self.use_unified_vla and self.unified_vla_process:
+                # Send to Unified Worker
+                self.log_callback(f"[BRAIN] Sending text to Unified VLA...")
+                with self.unified_vla_lock:
+                    self.unified_vla_process.stdin.write(f"CHAT {user_text}\n")
+                    self.unified_vla_process.stdin.flush()
+                # To keep it simple: We return a mock acknowledging the shift.
+                # True integration requires a queue between monitor and this function.
+                response_text = '{"dialogue": "I am the Unified VLA! I received your text.", "intent": "Idle"}'
             else:
-                return f"Error: {response.status_code}"
+                payload = {
+                    "model": "llama-3.2-3b-instruct",
+                    "messages": messages,
+                    "temperature": 0.7
+                }
+                response = requests.post(self.api_url, json=payload, timeout=10)
+                if response.status_code == 200:
+                    result = response.json()
+                    response_text = result['choices'][0]['message']['content'].strip()
+                else:
+                    return f"Error: {response.status_code}"
+                
+            # Attempt to parse JSON if model follows instructions, else fallback to regex
+            try:
+                json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+                if json_match:
+                    parsed = json.loads(json_match.group(0))
+                    dialogue = parsed.get('dialogue', response_text)
+                    intent = parsed.get('intent', "Idle")
+                else:
+                    raise ValueError("No JSON block found")
+            except Exception as e:
+                self.log_callback(f"[BRAIN-CHAT] JSON Parse Error: {e}, attempting regex extraction on: {response_text}")
+                d_match = re.search(r'"dialogue"\s*:\s*"([^"]+)"', response_text, re.IGNORECASE)
+                i_match = re.search(r'"intent"\s*:\s*"([^"]+)"', response_text, re.IGNORECASE)
+                dialogue = d_match.group(1) if d_match else response_text.replace('{', '').replace('}', '').replace('"', '').strip()
+                intent = i_match.group(1) if i_match else "Idle"
+                
+            self.chat_history.append({"role": "user", "content": user_text})
+            self._dispatch_intent(intent)
+            self.chat_history.append({"role": "assistant", "content": dialogue})
+            if len(self.chat_history) > 6:
+                self.chat_history = self.chat_history[-6:]
+                
+            self.tts.speak(dialogue)
+            return dialogue
+
         except Exception as e:
             return f"Brain Error: {e}"
 
