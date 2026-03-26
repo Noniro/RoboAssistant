@@ -2,6 +2,8 @@ import requests
 import json
 import re
 import threading
+import os
+import time
 from profile_manager import ProfileManager
 from tts_manager import TTSManager
 
@@ -27,36 +29,50 @@ class ReasoningBridge:
         self.last_scene = "Nothing seen yet."
         self.chat_history = [] # Stores last 5 interactions to prevent amnesia
         self.enable_vlm_reasoning = True
-        self.physical_interaction_enabled = False
+        self.physical_interaction_enabled = True
         
-        # Unified VLA integration
-        self.use_unified_vla = True # Transitioned to Unified Architecture
+        # Unified VLA integration - HARDCODED AS PRIMARY
+        self.use_unified_vla = True 
+        self.api_url = None # External LLM API Disabled
         self.unified_vla_process = None
         self.unified_vla_lock = threading.Lock()
         
         # VLA intent routing: { intent_string_from_LLM: vla_policy_name }
         # e.g. { "pick_and_place": "pick_place_Iloveyoublock" }
         self.vla_intents = {}
+        self.vla_ready = False
+        self.last_vla_reply = None
+        self.ui_parent = None
         
         if self.use_unified_vla:
-            self.log_callback("[BRAIN] Environment: Windows. Reasoning via UNIFIED VLA.")
-            self._start_unified_vla()
+            self.log_callback("[BRAIN] Environment: Windows. Unified VLA selected.")
+            # self._start_unified_vla() # MOVED to separate call to avoid thread-loop crash
         else:
             self.log_callback("[BRAIN] Environment: Windows. Reasoning via Local API (localhost:1234).")
+
+    def initialize_worker(self):
+        """Called by UI after mainloop starts to avoid Tcl thread errors."""
+        if self.use_unified_vla and not self.unified_vla_process:
+             self._start_unified_vla()
 
     def _start_unified_vla(self):
         import subprocess
         import sys
         self.log_callback("[BRAIN] 🚀 Booting Unified VLA orchestrator. This takes ~20s to load 14GB weights...")
         try:
-            # We must use Popen to keep it alive
+            # We need the robot config for the worker to access cameras
+            config_path = "config.yaml" # Default or passed from UI
+            if not os.path.exists(config_path):
+                 # Fallback to creating a temp one or using current arm settings
+                 pass
+
             self.unified_vla_process = subprocess.Popen(
-                [sys.executable, "unified_vla_worker.py"],
+                [sys.executable, "unified_vla_worker.py", "--config", config_path],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT, # Merge stderr so we can see load errors
+                stderr=subprocess.STDOUT, 
                 text=True,
-                bufsize=1 # Line buffered
+                bufsize=1 
             )
             # Start a background thread to read its init signals and replies
             threading.Thread(target=self._monitor_unified_vla, daemon=True).start()
@@ -74,12 +90,16 @@ class ReasoningBridge:
             
             if line == "READY":
                 self.log_callback("[VLA-WORKER] Unified VLA Model is Loaded into VRAM & Ready!")
+                self.vla_ready = True
             elif line.startswith("CHAT_REPLY"):
-                # We handle this asynchronously or in the blocking call.
-                # Since manual_interact blocks, it's better to read it there.
-                # However, if we read here, we consume the stream.
-                # Let's just log it if we aren't careful, or we use a queue.
-                pass
+                reply = line[len("CHAT_REPLY "):]
+                self.last_vla_reply = reply
+                self.log_callback(f"[VLA-REASONING] Brain says: {reply}")
+                # Log to the Thought Log in UI if available
+                if hasattr(self, "ui_parent"):
+                    self.ui_parent.log_event(f"[THOUGHT] {reply}")
+            elif line == "FINISHED":
+                self.log_callback("[VLA-WORKER] Physical Action Completed.")
             else:
                 self.log_callback(f"[VLA-WORKER] {line}")
 
@@ -215,65 +235,10 @@ class ReasoningBridge:
         )
 
     def generate_dialogue_and_intent(self, scene_description, identity=None):
-        self.last_scene = scene_description
-        self.log_callback(f"[BRAIN] Reasoning over scene: {scene_description} (Seen: {identity or 'Unknown'})")
-        
-        # Determine specific prompt based on identity
-        custom_prompt = ""
-        if identity:
-            profile = self.profile_manager.get_profile(identity)
-            if profile:
-                custom_prompt = f"\n\nSPECIAL INSTRUCTIONS FOR THIS PERSON ({identity}): {profile['prompt']}"
-
-        custom_prompt += self._build_skills_prompt()
-
-        messages = [
-            {"role": "system", "content": self.system_prompt + custom_prompt},
-            {"role": "user", "content": f"Scene Description: {scene_description}. Determine my next intent."}
-        ]
-
-        try:
-            payload = {
-                "model": "llama-3.2-3b-instruct", # Updated to match loaded model
-                "messages": messages,
-                "temperature": 0.7
-            }
-            
-            response = requests.post(self.api_url, json=payload, timeout=10)
-            if response.status_code == 200:
-                result = response.json()
-                response_text = result['choices'][0]['message']['content'].strip()
-                self.log_callback(f"[BRAIN] Raw Model Output: {response_text}")
-                
-                try:
-                    json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
-                    if json_match:
-                        parsed = json.loads(json_match.group(0))
-                        dialogue = parsed.get('dialogue', response_text)
-                        intent = parsed.get('intent', "Idle")
-                    else:
-                        dialogue = response_text
-                        intent = "Idle"
-                except json.JSONDecodeError:
-                    self.log_callback("[BRAIN] JSON Parse Error. Falling back to raw text.")
-                    dialogue = response_text
-                    intent = "Idle"
-            else:
-                self.log_callback(f"[BRAIN] API Error: {response.status_code}")
-                dialogue = "I'm having trouble thinking."
-                intent = "Idle"
-                
-        except Exception as e:
-            self.log_callback(f"[BRAIN] Inference error: {e}")
-            dialogue = "Brain Error."
-            intent = "Idle"
-        
-        self.log_callback(f"[BRAIN] Generated Dialogue: {dialogue}")
-        self.log_callback(f"[BRAIN] Intent determined: {intent}")
-        
-        self.tts.speak(dialogue)
-        self._dispatch_intent(intent)
-        return dialogue, intent
+        """Unified VLA handles this now."""
+        # Instead of calling local API, we send it to the unified worker if needed.
+        # However, manual_interact is the primary path now.
+        return "Thinking...", "Idle"
 
     def manual_interact(self, user_text, identity=None):
         """
@@ -306,15 +271,39 @@ class ReasoningBridge:
 
         try:
             if self.use_unified_vla and self.unified_vla_process:
-                # Send to Unified Worker
-                self.log_callback(f"[BRAIN] Sending text to Unified VLA...")
+                # 1. Reasoning Phase
+                self.log_callback(f"[BRAIN] Asking Unified VLA (OpenVLA-7B): {user_text}")
+                self.last_vla_reply = None
                 with self.unified_vla_lock:
                     self.unified_vla_process.stdin.write(f"CHAT {user_text}\n")
                     self.unified_vla_process.stdin.flush()
-                # To keep it simple: We return a mock acknowledging the shift.
-                # True integration requires a queue between monitor and this function.
-                response_text = '{"dialogue": "I am the Unified VLA! I received your text.", "intent": "Idle"}'
+                
+                # Wait for reply (handled by monitor thread)
+                start_w = time.time()
+                while self.last_vla_reply is None and time.time() - start_w < 20: 
+                    time.sleep(0.1)
+                
+                if self.last_vla_reply:
+                    dialogue = self.last_vla_reply
+                else:
+                    dialogue = "I'm still loading the scene in my weights..."
+                
+                # 2. Action Trigger Phase
+                # Improved detection: check for pick/place/move etc.
+                is_task = any(word in user_text.lower() for word in ["pick", "place", "move", "grab", "reach", "put", "take"])
+                if is_task:
+                    self.log_callback(f"[BRAIN] Task identified. Triggering VLA physical control...")
+                    with self.unified_vla_lock:
+                        # ACTION <duration> <instruction>
+                        self.unified_vla_process.stdin.write(f"ACTION 60 {user_text}\n")
+                        self.unified_vla_process.stdin.flush()
+                
+                self.chat_history.append({"role": "user", "content": user_text})
+                self.chat_history.append({"role": "assistant", "content": dialogue})
+                self.tts.speak(dialogue)
+                return dialogue
             else:
+                return "Unified VLA Worker not running."
                 payload = {
                     "model": "llama-3.2-3b-instruct",
                     "messages": messages,

@@ -215,6 +215,9 @@ class RobotSupervisorApp(ctk.CTk):
         self.brain.ui_parent = self
         self.vision = VisionWorker(self.log_event, self.brain, event_callback=self.handle_vision_event)
         self.brain.vision_worker = self.vision # Link them back
+        
+        # Start VLA Worker with a slight delay to ensure UI thread is stable
+        self.after(1000, self.brain.initialize_worker)
 
         # --- Auto-register trained VLA policies ---
         # These are scanned at startup so both the UI and LLM brain can use them.
@@ -379,10 +382,16 @@ class RobotSupervisorApp(ctk.CTk):
         return None
 
     def log_event(self, message):
-        self.thought_log.configure(state="normal")
-        self.thought_log.insert("end", message + "\n")
-        self.thought_log.configure(state="disabled")
-        self.thought_log.see("end")
+        """Thread-safe logging to the thought_log textbox."""
+        def _execute():
+            try:
+                self.thought_log.configure(state="normal")
+                self.thought_log.insert("end", message + "\n")
+                self.thought_log.configure(state="disabled")
+                self.thought_log.see("end")
+            except:
+                pass # Window closed?
+        self.after(0, _execute)
 
     def toggle_settings(self):
         if self.settings_visible:
@@ -927,8 +936,8 @@ class ProfileManagerWindow(ctk.CTkToplevel):
         """
         Captures a frame from the live camera and saves the encoding.
         """
-        import face_recognition
-        import numpy as np
+        # Use the (potentially mocked) instance from vision module to avoid crashes
+        face_rec = self.parent.vision.face_recognition
         
         try:
             ret, frame = self.parent.cap.read()
@@ -938,8 +947,8 @@ class ProfileManagerWindow(ctk.CTkToplevel):
             
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             # Find all faces in the image
-            face_locations = face_recognition.face_locations(rgb_frame)
-            encodings = face_recognition.face_encodings(rgb_frame, face_locations)
+            face_locations = face_rec.face_locations(rgb_frame)
+            encodings = face_rec.face_encodings(rgb_frame, face_locations)
             
             if encodings:
                 encoding = encodings[0]
@@ -1210,6 +1219,26 @@ class SkillStudioWindow(ctk.CTkToplevel):
         self.ai_record_btn.pack(pady=5, padx=10, fill="x")
 
         # -------------------------------------------------------------------
+        # 1b. Manual VLA Control (Integrated)
+        # -------------------------------------------------------------------
+        self.manual_vla_frame = ctk.CTkFrame(self)
+        self.manual_vla_frame.pack(fill="x", padx=10, pady=(5, 10))
+        
+        ctk.CTkLabel(self.manual_vla_frame, text="🦾 Manual VLA Command (Integrated)", font=ctk.CTkFont(weight="bold")).pack(pady=5)
+        
+        self.manual_vla_cmd_var = ctk.StringVar(value="pick the i love you block")
+        self.manual_vla_entry = ctk.CTkEntry(self.manual_vla_frame, textvariable=self.manual_vla_cmd_var, placeholder_text="Command (e.g. pick block)")
+        self.manual_vla_entry.pack(pady=5, padx=10, fill="x")
+        
+        self.manual_vla_btn = ctk.CTkButton(
+            self.manual_vla_frame, 
+            text="🚀 Execute VLA (Reasoning + Action)", 
+            fg_color="#0057b7", hover_color="#004a9e",
+            command=self.execute_manual_vla
+        )
+        self.manual_vla_btn.pack(pady=5, padx=10, fill="x")
+
+        # -------------------------------------------------------------------
         # 2. Instant Kinematic Replay Section
         # -------------------------------------------------------------------
         ctk.CTkLabel(self, text="Instant Kinematic Replay (Blind)", font=ctk.CTkFont(size=14, weight="bold")).pack(pady=5)
@@ -1441,6 +1470,23 @@ class SkillStudioWindow(ctk.CTkToplevel):
             self.skill_name_var.set("")
             self.teleop_btn.configure(state="normal")
             self.refresh_skill_list()
+
+    def execute_manual_vla(self):
+        cmd = self.manual_vla_cmd_var.get().strip()
+        if not cmd:
+            self.parent.log_event("[VLA-MANUAL] Please enter a command.")
+            return
+            
+        self.parent.log_event(f"[VLA-MANUAL] Triggering unified VLA task: '{cmd}'")
+        
+        # We run this in a thread to keep UI semi-responsive, although manual_interact has some sleep/waits
+        import threading
+        def run_task():
+             # Identity is set to None or "Manual-Tester"
+             self.parent.brain.manual_interact(cmd, identity="Manual-Tester")
+             
+        threading.Thread(target=run_task, daemon=True).start()
+        self.parent.log_event("[VLA-MANUAL] Task sent to Brain. Check Thought Log for Reasoning.")
 
 class ManualMotorControlWindow(ctk.CTkToplevel):
     def __init__(self, parent):

@@ -12,11 +12,15 @@ import threading
 import numpy as np
 from PIL import Image
 
-try:
-    import face_recognition
-    HAS_FACE_REC = True
-except ImportError:
-    HAS_FACE_REC = False
+# [DEBUG] Temporarily disabled face_recognition to allow VLA-only testing
+HAS_FACE_REC = False
+class MockFaceRec:
+    def face_locations(self, *args, **kwargs): return []
+    def face_encodings(self, *args, **kwargs): return []
+    def compare_faces(self, *args, **kwargs): return []
+    def face_distance(self, *args, **kwargs): return []
+face_recognition = MockFaceRec()
+print("[INFO] Face recognition manually DISABLED to skip model-loading dependencies.")
 
 from profile_manager import ProfileManager
 
@@ -43,7 +47,7 @@ class VisionWorker:
         self.ema_alpha = 0.6 # Faster response (0.1 = smooth/slow, 0.9 = fast/jittery)
         
         # LM Studio / Local API Settings
-        self.api_url = "http://localhost:1234/v1/chat/completions" # Default LM Studio Port
+        self.api_url = None # Disabled - Using LOCAL UNIFIED VLA 
         
         # Low power motion/face detection setup
         self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
@@ -91,23 +95,27 @@ class VisionWorker:
             # Load YOLO if needed
             if "yolo" in required_models:
                 if self.net is None:
-                    self.log_callback("[VISION] Loading YOLOv4-tiny...")
-                    self.net = cv2.dnn.readNet("yolov4-tiny.weights", "yolov4-tiny.cfg")
-                    if cv2.cuda.getCudaEnabledDeviceCount() > 0:
-                        self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
-                        self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
-                    else:
-                        self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
-                        self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
-                        
-                    with open("coco.names", "r") as f:
-                        self.coco_classes = [line.strip() for line in f.readlines()]
-                        
                     try:
-                        layer_names = self.net.getLayerNames()
-                        self.output_layers = [layer_names[i - 1] for i in self.net.getUnconnectedOutLayers()]
-                    except:
-                        self.output_layers = self.net.getUnconnectedOutLayersNames()
+                        self.log_callback("[VISION] Loading YOLOv4-tiny...")
+                        self.net = cv2.dnn.readNet("yolov4-tiny.weights", "yolov4-tiny.cfg")
+                        if cv2.cuda.getCudaEnabledDeviceCount() > 0:
+                            self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
+                            self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
+                        else:
+                            self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+                            self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+                            
+                        with open("coco.names", "r") as f:
+                            self.coco_classes = [line.strip() for line in f.readlines()]
+                            
+                        try:
+                            layer_names = self.net.getLayerNames()
+                            self.output_layers = [layer_names[i - 1] for i in self.net.getUnconnectedOutLayers()]
+                        except:
+                            self.output_layers = self.net.getUnconnectedOutLayersNames()
+                    except Exception as e:
+                        self.log_callback(f"[VISION] YOLO loading failed (missing weights?): {e}")
+                        self.net = None
             else:
                 self.net = None # Unload to save VRAM
 
@@ -257,26 +265,32 @@ class VisionWorker:
         faces = self.face_cascade.detectMultiScale(gray, 1.1, 4)
         has_face = len(faces) > 0
 
-        if has_face and HAS_FACE_REC and self.known_face_encodings:
-            # Only run heavy face encoding once every 10 frames
-            if self.frame_count % 10 == 0:
-                small_frame = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
-                rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
-                face_locations = face_recognition.face_locations(rgb_small_frame)
-                face_encodings = face_recognition.face_encodings(rgb_small_frame, face_locations)
-                
-                self.last_known_face_locations = face_locations
-                self.last_known_face_names = []
-                
-                for face_encoding in face_encodings:
-                    matches = face_recognition.compare_faces(self.known_face_encodings, face_encoding)
-                    name = "Unknown"
-                    face_distances = face_recognition.face_distance(self.known_face_encodings, face_encoding)
-                    if len(face_distances) > 0:
-                        best_match_index = np.argmin(face_distances)
-                        if matches[best_match_index]:
-                            name = self.known_face_names[best_match_index]
-                    self.last_known_face_names.append(name)
+        if has_face and HAS_FACE_REC and getattr(self, "known_face_encodings", []):
+            try:
+                # Only run heavy face encoding once every 10 frames
+                if self.frame_count % 10 == 0:
+                    small_frame = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
+                    rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
+                    face_locations = face_recognition.face_locations(rgb_small_frame)
+                    face_encodings = face_recognition.face_encodings(rgb_small_frame, face_locations)
+                    
+                    self.last_known_face_locations = face_locations
+                    self.last_known_face_names = []
+                    
+                    for face_encoding in face_encodings:
+                        matches = face_recognition.compare_faces(self.known_face_encodings, face_encoding)
+                        name = "Unknown"
+                        face_distances = face_recognition.face_distance(self.known_face_encodings, face_encoding)
+                        if len(face_distances) > 0:
+                            best_match_index = np.argmin(face_distances)
+                            if matches[best_match_index]:
+                                name = self.known_face_names[best_match_index]
+                        self.last_known_face_names.append(name)
+            except Exception as e:
+                # Catch "Please install face_recognition_models" or other errors
+                # and disable face rec for the rest of the session
+                self.log_callback(f"[VISION] Face recognition failed/uninstalled models: {e}")
+                globals()["HAS_FACE_REC"] = False
             
             # Draw boxes based on the heavy face_recognition if available
             if self.last_known_face_locations:
@@ -481,59 +495,12 @@ class VisionWorker:
         return self._vlm_inference(frame)
 
     def _trigger_vlm(self, frame, identity=None):
-        self.log_callback("[VISION-VLM] Triggering background scene analysis...")
-        scene_description = self._vlm_inference(frame)
-        if scene_description:
-            with self.lock:
-                self.latest_scene_description = scene_description
-            self.log_event_for_vlm(scene_description)
-            if self.brain:
-                self.brain.generate_dialogue_and_intent(scene_description, identity)
+        # Background scene analysis is handled by the Unified VLA on request
+        pass
 
     def _vlm_inference(self, frame):
-        """
-        Core VLM API call with coordinate parsing.
-        """
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        pil_img = Image.fromarray(rgb_frame)
-        buffer = io.BytesIO()
-        pil_img.save(buffer, format="JPEG")
-        base64_image = base64.b64encode(buffer.getvalue()).decode('utf-8')
-
-        prompt = (
-            "Describe the overall scene, the environment, and the main action happening. "
-            "Keep it to 1-2 short sentences. Do not list standard objects or bounding boxes."
-        )
-
-        payload = {
-            "model": "qwen2-vl-2b-instruct",
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
-                    ]
-                }
-            ],
-            "max_tokens": 100
-        }
-
-        try:
-            response = requests.post(self.api_url, json=payload, timeout=15)
-            if response.status_code == 200:
-                result = response.json()
-                content = result['choices'][0]['message']['content'].strip()
-                
-                with self.lock:
-                    self.latest_scene_description = content
-                
-                return content
-            else:
-                return None
-        except Exception as e:
-            self.log_callback(f"[VISION-VLM] Inference error: {e}")
-            return None
+        """LOCAL UNIFIED VLA handles this now via brain_module."""
+        return "Using Local Unified OpenVLA Brain."
 
     def log_event_for_vlm(self, description):
         # Helper to log and store description
