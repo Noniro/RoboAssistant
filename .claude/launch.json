@@ -1,0 +1,28 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "RoboAssistant UI",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["main_ui.py"],
+      "port": 8080
+    },
+    {
+      "name": "VLA Worker (standalone)",
+      "runtimeExecutable": "python",
+      "runtimeArgs": [
+        "unified_vla_worker.py",
+        "--main-cam", "0",
+        "--grip-cam", "1",
+        "--side-cam", "-1"
+      ],
+      "port": 8081
+    },
+    {
+      "name": "VLA Training",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["train_openvla_lora.py"],
+      "port": 8082
+    }
+  ]
+}

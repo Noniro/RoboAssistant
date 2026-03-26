@@ -1,11 +1,13 @@
 {
     "camera_name": "Camera 0",
     "camera_index": 0,
+    "gripper_camera_name": "Camera 1",
+    "gripper_camera_index": 1,
+    "side_camera_name": "Disabled",
+    "side_camera_index": -1,
     "mic_name": "Microphone (PRO X 2 LIGHTSPEED)",
     "spk_name": "Speakers (High Definition Audio",
     "voice_name": "Microsoft David Desktop - English (United States)",
     "proactive_enabled": false,
-    "volume": 0.6085714285714285,
-    "gripper_camera_name": "Camera 1",
-    "gripper_camera_index": 1
+    "volume": 0.6085714285714285
 }

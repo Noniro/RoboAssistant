@@ -58,23 +58,38 @@ class ReasoningBridge:
     def _start_unified_vla(self):
         import subprocess
         import sys
-        self.log_callback("[BRAIN] 🚀 Booting Unified VLA orchestrator. This takes ~20s to load 14GB weights...")
+        self.log_callback("[BRAIN] Booting Unified VLA orchestrator. Cameras start instantly, model loads in ~20s...")
         try:
-            # We need the robot config for the worker to access cameras
-            config_path = "config.yaml" # Default or passed from UI
-            if not os.path.exists(config_path):
-                 # Fallback to creating a temp one or using current arm settings
-                 pass
+            config_path = "config.yaml"
+
+            # Read camera indices from config.json so VLA worker owns the right cameras
+            cam_cfg = {}
+            try:
+                with open("config.json", "r") as f:
+                    import json as _json
+                    cam_cfg = _json.load(f)
+            except Exception:
+                pass
+
+            main_cam = cam_cfg.get("camera_index",        0)
+            grip_cam = cam_cfg.get("gripper_camera_index", 1)
+            side_cam = cam_cfg.get("side_camera_index",   -1)
 
             self.unified_vla_process = subprocess.Popen(
-                [sys.executable, "unified_vla_worker.py", "--config", config_path],
+                [
+                    sys.executable, "unified_vla_worker.py",
+                    "--config",   config_path,
+                    "--main-cam", str(main_cam),
+                    "--grip-cam", str(grip_cam),
+                    "--side-cam", str(side_cam),
+                ],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT, 
+                stderr=subprocess.STDOUT,
                 text=True,
-                bufsize=1 
+                bufsize=1,
             )
-            # Start a background thread to read its init signals and replies
+            # Background thread reads all signals / replies from the worker
             threading.Thread(target=self._monitor_unified_vla, daemon=True).start()
         except Exception as e:
             self.log_callback(f"[BRAIN] Failed to start Unified VLA: {e}")
@@ -87,19 +102,45 @@ class ReasoningBridge:
             if not line: break
             line = line.strip()
             if not line: continue
-            
-            if line == "READY":
-                self.log_callback("[VLA-WORKER] Unified VLA Model is Loaded into VRAM & Ready!")
+
+            if line == "CAMERAS_READY":
+                self.log_callback("[VLA-WORKER] Cameras are live — switching UI feed to VLA bridge.")
+                # Tell the UI to switch from ThreadedCamera to the shared memory bridge
+                ui = getattr(self, "ui_parent", None)
+                if ui and hasattr(ui, "on_cameras_ready"):
+                    ui.after(0, ui.on_cameras_ready)
+
+            elif line == "READY":
+                self.log_callback("[VLA-WORKER] Model loaded into VRAM — fully operational!")
                 self.vla_ready = True
+
             elif line.startswith("CHAT_REPLY"):
                 reply = line[len("CHAT_REPLY "):]
                 self.last_vla_reply = reply
-                self.log_callback(f"[VLA-REASONING] Brain says: {reply}")
-                # Log to the Thought Log in UI if available
-                if hasattr(self, "ui_parent"):
-                    self.ui_parent.log_event(f"[THOUGHT] {reply}")
+                self.log_callback(f"[VLA-REASONING] {reply}")
+                ui = getattr(self, "ui_parent", None)
+                if ui:
+                    ui.after(0, ui.log_event, f"[THOUGHT] {reply}")
+
+            elif line.startswith("ACTION_START"):
+                action_desc = line[len("ACTION_START "):]
+                self.log_callback(f"[VLA-ACTION] Starting physical action: {action_desc}")
+                ui = getattr(self, "ui_parent", None)
+                if ui:
+                    ui.after(0, ui.log_event, f"[ACTION] {action_desc}")
+
             elif line == "FINISHED":
-                self.log_callback("[VLA-WORKER] Physical Action Completed.")
+                self.log_callback("[VLA-WORKER] Physical action completed.")
+
+            elif line == "STOPPED":
+                self.log_callback("[VLA-WORKER] Action aborted.")
+
+            elif line == "HISTORY_CLEARED":
+                self.log_callback("[VLA-WORKER] Conversation history cleared.")
+
+            elif line.startswith("ERROR"):
+                self.log_callback(f"[VLA-WORKER] {line}")
+
             else:
                 self.log_callback(f"[VLA-WORKER] {line}")
 
@@ -287,19 +328,14 @@ class ReasoningBridge:
                     dialogue = self.last_vla_reply
                 else:
                     dialogue = "I'm still loading the scene in my weights..."
-                
-                # 2. Action Trigger Phase
-                # Improved detection: check for pick/place/move etc.
-                is_task = any(word in user_text.lower() for word in ["pick", "place", "move", "grab", "reach", "put", "take"])
-                if is_task:
-                    self.log_callback(f"[BRAIN] Task identified. Triggering VLA physical control...")
-                    with self.unified_vla_lock:
-                        # ACTION <duration> <instruction>
-                        self.unified_vla_process.stdin.write(f"ACTION 60 {user_text}\n")
-                        self.unified_vla_process.stdin.flush()
-                
-                self.chat_history.append({"role": "user", "content": user_text})
+
+                # The VLA worker now decides whether a physical action is needed.
+                # No keyword detection here — the worker handles classification
+                # via model prefix [CHAT]/[ACTION] + keyword fallback internally.
+                self.chat_history.append({"role": "user",      "content": user_text})
                 self.chat_history.append({"role": "assistant", "content": dialogue})
+                if len(self.chat_history) > 10:
+                    self.chat_history = self.chat_history[-10:]
                 self.tts.speak(dialogue)
                 return dialogue
             else:

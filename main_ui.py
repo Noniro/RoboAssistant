@@ -24,6 +24,7 @@ from PIL import Image, ImageTk
 import threading
 import time
 import platform
+from camera_bridge import CameraReader, CAM_MAIN, CAM_SIDE, CAM_GRIP
 
 try:
     from vision_module import VisionWorker
@@ -124,22 +125,38 @@ class RobotSupervisorApp(ctk.CTk):
         self.arm_manual_btn = ctk.CTkButton(self.arm_cmds_frame, text="🕹 Manual Motor Control", fg_color="#0955b5", hover_color="#05338c", command=self.open_manual_motor_control)
         self.arm_manual_btn.pack(side="left", padx=5)
         
-        # Camera feeds inside camera_frame: two panels stacked vertically
+        # Camera feeds — all 3 cameras stacked vertically.
+        # Frames come from the VLA worker's shared-memory bridge so the UI
+        # sees exactly what the model sees (zero duplication, no bandwidth waste).
         self.camera_feeds_frame = ctk.CTkFrame(self.camera_frame, fg_color="transparent")
         self.camera_feeds_frame.pack(expand=True, fill="both")
-        
-        # Main camera
+
+        # Main / top-view camera  (primary VLA inference camera)
         self.main_cam_frame = ctk.CTkFrame(self.camera_feeds_frame)
         self.main_cam_frame.pack(side="top", expand=True, fill="both", padx=5, pady=5)
-        ctk.CTkLabel(self.main_cam_frame, text="📷 Main Camera", font=ctk.CTkFont(size=12, weight="bold")).pack(side="top", pady=2)
-        self.video_label = ctk.CTkLabel(self.main_cam_frame, text="")
+        ctk.CTkLabel(self.main_cam_frame, text="📷 Top View  [VLA Primary]",
+                     font=ctk.CTkFont(size=12, weight="bold")).pack(side="top", pady=2)
+        self.video_label = ctk.CTkLabel(self.main_cam_frame, text="Waiting for VLA cameras...",
+                                        text_color="gray")
         self.video_label.pack(expand=True, fill="both")
-        
-        # Gripper camera
+
+        # Side-view camera
+        self.side_cam_frame = ctk.CTkFrame(self.camera_feeds_frame)
+        self.side_cam_frame.pack(side="top", expand=True, fill="both", padx=5, pady=5)
+        ctk.CTkLabel(self.side_cam_frame, text="↔ Side View",
+                     font=ctk.CTkFont(size=12, weight="bold")).pack(side="top", pady=2)
+        self.side_video_label = ctk.CTkLabel(self.side_cam_frame, text="Side camera offline",
+                                             text_color="gray")
+        self.side_video_label.pack(expand=True, fill="both")
+
+        # Gripper / wrist camera
         self.gripper_cam_frame = ctk.CTkFrame(self.camera_feeds_frame)
         self.gripper_cam_frame.pack(side="top", expand=True, fill="both", padx=5, pady=5)
-        ctk.CTkLabel(self.gripper_cam_frame, text="🤖 Gripper Camera", font=ctk.CTkFont(size=12, weight="bold")).pack(side="top", pady=2)
-        self.gripper_video_label = ctk.CTkLabel(self.gripper_cam_frame, text="")
+        ctk.CTkLabel(self.gripper_cam_frame, text="🤖 Gripper View",
+                     font=ctk.CTkFont(size=12, weight="bold")).pack(side="top", pady=2)
+        self.gripper_video_label = ctk.CTkLabel(self.gripper_cam_frame,
+                                                text="GRIPPER CAMERA OFFLINE\n(Configure in Hardware Settings)",
+                                                text_color="orange")
         self.gripper_video_label.pack(expand=True, fill="both")
 
         # Sidebar frame
@@ -242,6 +259,16 @@ class RobotSupervisorApp(ctk.CTk):
         if self.settings.get("gripper_camera_name") in self.cam_names:
             self.gripper_cam_dropdown.set(self.settings["gripper_camera_name"])
         self.gripper_cam_dropdown.pack(pady=5, padx=10, fill="x")
+
+        # Side Camera Selection
+        ctk.CTkLabel(self.settings_frame, text="Side Camera").pack(pady=(5,0))
+        side_cam_names = ["Disabled"] + self.cam_names
+        self.side_cam_dropdown = ctk.CTkOptionMenu(self.settings_frame, values=side_cam_names, command=self.change_side_camera)
+        saved_side = self.settings.get("side_camera_name", "Disabled")
+        self.side_cam_dropdown.set(saved_side if saved_side in side_cam_names else "Disabled")
+        self.side_cam_dropdown.pack(pady=5, padx=10, fill="x")
+        ctk.CTkLabel(self.settings_frame, text="⚠ Camera changes take effect on restart",
+                     font=ctk.CTkFont(size=10), text_color="gray").pack(pady=(0,5))
         
         # Audio Selection (Placeholders)
         mics, speakers = list_audio_devices()
@@ -295,10 +322,14 @@ class RobotSupervisorApp(ctk.CTk):
         self.control_btn = ctk.CTkButton(self.sidebar_frame, text="Start System", command=self.toggle_system, fg_color="green")
         self.control_btn.pack(pady=20, padx=20, fill="x")
         
-        self.log_event("[SYSTEM] Initializing threaded cameras...")
-        self.cap_thread = self._init_camera_thread("camera_index", "Main Camera")
-        self.gripper_cap_thread = self._init_camera_thread("gripper_camera_index", "Gripper Camera")
-        
+        # Camera bridge reader — reads frames written by the VLA worker subprocess.
+        # No cameras are opened here; the VLA worker owns them all.
+        self._cam_reader = CameraReader()
+        self._bridge_active = False   # flips to True when CAMERAS_READY is received
+        # Keep legacy ThreadedCamera refs set to None so existing guard code is safe
+        self.cap_thread = None
+        self.gripper_cap_thread = None
+
         self.system_running = False
         self.update_camera_feed()
 
@@ -419,13 +450,21 @@ class RobotSupervisorApp(ctk.CTk):
         self.settings["camera_name"] = self.cam_dropdown.get()
         if hasattr(self, 'gripper_cam_dropdown'):
             self.settings["gripper_camera_name"] = self.gripper_cam_dropdown.get()
-            
-        # Find camera index for name
+        if hasattr(self, 'side_cam_dropdown'):
+            side_name = self.side_cam_dropdown.get()
+            self.settings["side_camera_name"] = side_name
+
+        # Find camera indices for names
         for c in self.cam_list:
             if c["name"] == self.settings.get("camera_name"):
                 self.settings["camera_index"] = c["index"]
             if c["name"] == self.settings.get("gripper_camera_name"):
                 self.settings["gripper_camera_index"] = c["index"]
+            if c["name"] == self.settings.get("side_camera_name"):
+                self.settings["side_camera_index"] = c["index"]
+        # "Disabled" selection → index -1
+        if self.settings.get("side_camera_name") == "Disabled":
+            self.settings["side_camera_index"] = -1
         
         self.settings["mic_name"] = self.mic_dropdown.get()
         self.settings["spk_name"] = self.spk_dropdown.get()
@@ -510,6 +549,27 @@ class RobotSupervisorApp(ctk.CTk):
              self.gripper_cap_thread = None
         else:
              self.log_event(f"[SYSTEM] Gripper camera switched successfully.")
+
+    def change_side_camera(self, choice):
+        """Save side camera selection. Takes effect on next restart."""
+        self.settings["side_camera_name"] = choice
+        if choice == "Disabled":
+            self.settings["side_camera_index"] = -1
+        else:
+            for c in self.cam_list:
+                if c["name"] == choice:
+                    self.settings["side_camera_index"] = c["index"]
+                    break
+        self.save_settings()
+        self.log_event(f"[SYSTEM] Side camera set to '{choice}'. Restart to apply.")
+
+    def on_cameras_ready(self):
+        """
+        Called by brain_module when the VLA worker emits CAMERAS_READY.
+        Switches the UI feed source from placeholder text to the camera bridge.
+        """
+        self._bridge_active = True
+        self.log_event("[SYSTEM] VLA camera bridge active — displaying live feed.")
 
     def change_voice(self, choice):
         self.save_settings()
@@ -711,17 +771,13 @@ class RobotSupervisorApp(ctk.CTk):
             self.vision.stop()
 
     def update_camera_feed(self):
-        # --- Main Camera Feed (Threaded) ---
-        ret, frame = False, None
-        if hasattr(self, 'cap_thread') and self.cap_thread:
-            ret, frame = self.cap_thread.read()
-        
-        # --- Gripper Camera Feed (Threaded) ---
-        gripper_frame = None
-        if hasattr(self, 'gripper_cap_thread') and self.gripper_cap_thread:
-            ret_g, frame_g = self.gripper_cap_thread.read()
-            if ret_g:
-                gripper_frame = frame_g
+        # ── Read all frames from the VLA worker's shared-memory bridge ────────
+        # The VLA worker owns every camera; we just read what it writes here.
+        # This means zero camera duplication and zero bandwidth waste.
+        frame,        _ = self._cam_reader.read(CAM_MAIN)
+        side_frame,   _ = self._cam_reader.read(CAM_SIDE)
+        gripper_frame, _ = self._cam_reader.read(CAM_GRIP)
+        ret = (frame is not None)
         
         # --- Security Mode: always detect on gripper for display; track only when enabled ---
         if self.system_running and self.mode_manager.current_mode == "Security" and gripper_frame is not None:
@@ -741,9 +797,10 @@ class RobotSupervisorApp(ctk.CTk):
                 objects = list(self.vision.object_metadata)
                 vlm_desc = self.vision.latest_scene_description
 
-            # DEBUG: Draw Index Overlay
-            if hasattr(self, 'cap_thread') and self.cap_thread:
-                cv2.putText(frame, f"Cam Index: {self.cap_thread.index}", (10, 470), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            # Source label overlay
+            cam_idx = self.settings.get("camera_index", 0)
+            cv2.putText(frame, f"VLA Cam: {cam_idx}", (10, 470),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
             for (top, right, bottom, left), name in faces:
                 cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 0), 2)
@@ -771,8 +828,22 @@ class RobotSupervisorApp(ctk.CTk):
             identity = self.vision.last_identity or "None"
             self.person_label.configure(text=f"Recognized: {identity}")
         else:
-            self.video_label.configure(image=None, text="MAIN CAMERA OFFLINE", text_color="red")
-        
+            msg = "Waiting for VLA cameras..." if not self._bridge_active else "MAIN CAMERA OFFLINE"
+            self.video_label.configure(image=None, text=msg, text_color="red")
+
+        # ── Side camera ───────────────────────────────────────────────────────
+        if side_frame is not None:
+            s_img   = Image.fromarray(cv2.cvtColor(side_frame, cv2.COLOR_BGR2RGB))
+            s_imgtk = ctk.CTkImage(light_image=s_img, size=(420, 315))
+            self.side_video_label.configure(image=s_imgtk, text="")
+            self.side_video_label.image = s_imgtk
+        else:
+            self.side_video_label.configure(
+                image=None,
+                text="Side camera offline\n(Set in Hardware Settings)",
+                text_color="gray",
+            )
+
         # --- Render gripper camera ---
         if gripper_frame is not None:
             # Draw YOLO detection boxes from gripper detections
@@ -794,9 +865,10 @@ class RobotSupervisorApp(ctk.CTk):
                 cy = int((top + bottom) / 2)
                 cv2.circle(gripper_frame, (cx, cy), 5, (0, 255, 255), -1)
             
-            # DEBUG: Draw Index Overlay
-            if hasattr(self, 'gripper_cap_thread') and self.gripper_cap_thread:
-                cv2.putText(gripper_frame, f"Cam Index: {self.gripper_cap_thread.index}", (10, 470), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            # Source label overlay
+            grip_idx = self.settings.get("gripper_camera_index", 1)
+            cv2.putText(gripper_frame, f"VLA Grip: {grip_idx}", (10, 470),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
             # Frame center crosshair (shows where arm will aim)
             cx_frame, cy_frame = frame_w // 2, frame_h // 2
@@ -833,47 +905,35 @@ class RobotSupervisorApp(ctk.CTk):
         ManualMotorControlWindow(self)
 
     def suspend_for_external_script(self):
-        """Temporarily release hardware (cameras, serial ports) so an external script can use them."""
-        self.log_event("[SYSTEM] Suspending UI hardware locks for external script...")
+        """
+        Suspend AI routines so an external script can use the serial port.
+        Cameras are owned by the VLA worker subprocess and stay open —
+        the shared-memory bridge continues running unaffected.
+        """
+        self.log_event("[SYSTEM] Suspending AI routines for external script...")
         self.system_running = False
         self.vision.stop()
-        
-        if hasattr(self, 'cap_thread') and self.cap_thread:
-            self.cap_thread.release()
-            self.cap_thread = None
-        if hasattr(self, 'gripper_cap_thread') and self.gripper_cap_thread:
-            self.gripper_cap_thread.release()
-            self.gripper_cap_thread = None
-            
         if hasattr(self, 'arm') and self.arm:
             self.arm.disconnect_arms()
-            
-        self.log_event("[SYSTEM] Hardware successfully suspended.")
+        self.log_event("[SYSTEM] AI routines suspended (cameras remain in VLA bridge).")
 
     def resume_from_external_script(self):
-        """Re-acquire hardware and restart UI loops after an external script finishes."""
-        self.log_event("[SYSTEM] Resuming UI hardware locks...")
-        
-        # Ensure deep cleanup of previous arm object if requested
+        """Re-start AI routines after an external script finishes."""
+        self.log_event("[SYSTEM] Resuming AI routines...")
         if hasattr(self, 'arm') and self.arm:
             self.arm.connected = False
             self.arm.robot = None
             self.arm.leader_robot = None
-            # Force re-scan and re-init fully
             self.arm.connect_arms()
-            
-        # Re-initialize camera threads
-        self.cap_thread = self._init_camera_thread("camera_index", "Main Camera")
-        self.gripper_cap_thread = self._init_camera_thread("gripper_camera_index", "Gripper Camera")
-        
         self.system_running = True
         self.vision.start()
-        self.log_event("[SYSTEM] Hardware successfully resumed.")
+        self.log_event("[SYSTEM] AI routines resumed.")
 
     def on_closing(self):
-        if hasattr(self, 'cap_thread') and self.cap_thread: self.cap_thread.release()
-        if hasattr(self, 'gripper_cap_thread') and self.gripper_cap_thread: self.gripper_cap_thread.release()
         self.vision.stop()
+        # Release shared-memory handles (VLA worker owns and cleans up the segments)
+        if hasattr(self, '_cam_reader'):
+            self._cam_reader.cleanup()
         self.destroy()
 
 class ProfileManagerWindow(ctk.CTkToplevel):
