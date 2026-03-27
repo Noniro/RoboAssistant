@@ -310,6 +310,15 @@ class UnifiedVLAWorker:
             lines.append(f"{role}: {turn['content']}")
         return "\n".join(lines)
 
+    def _vision_dtype(self) -> torch.dtype:
+        """Dtype of the vision backbone (float16 when loaded with 8-bit quant)."""
+        try:
+            return next(
+                self.model.base_model.model.vision_backbone.parameters()
+            ).dtype
+        except Exception:
+            return torch.float16
+
     def _gen_tokens(
         self,
         prompt: str,
@@ -321,6 +330,10 @@ class UnifiedVLAWorker:
         inputs = self.processor(
             text=prompt, images=image, return_tensors="pt"
         ).to(self.device)
+        # Processor returns float32 pixel_values but the 8-bit-quantized vision
+        # backbone keeps its weights in float16 → cast to match before forward pass.
+        if "pixel_values" in inputs and inputs["pixel_values"] is not None:
+            inputs["pixel_values"] = inputs["pixel_values"].to(self._vision_dtype())
         with torch.inference_mode():
             out = self.model.generate(
                 **inputs,
@@ -394,6 +407,8 @@ class UnifiedVLAWorker:
                 inputs = self.processor(
                     text=prompt, images=image, return_tensors="pt"
                 ).to(self.device)
+                if "pixel_values" in inputs and inputs["pixel_values"] is not None:
+                    inputs["pixel_values"] = inputs["pixel_values"].to(self._vision_dtype())
                 with torch.inference_mode():
                     out = self.model.generate(
                         **inputs, max_new_tokens=7, do_sample=False
@@ -450,6 +465,16 @@ class UnifiedVLAWorker:
         return any(kw in lower for kw in ACTION_KEYWORDS)
 
     @staticmethod
+    def _safe_str(text: str) -> str:
+        """
+        Make a string safe to print through a Windows pipe.
+        Replaces anything that can't round-trip through ASCII with '?'.
+        This prevents UnicodeEncodeError in colorama/wandb stdout wrappers
+        when the model generates Unicode arrows or special characters.
+        """
+        return text.encode("ascii", errors="replace").decode("ascii")
+
+    @staticmethod
     def _clean_reply(raw: str) -> str:
         """Strip classification prefix from model output before display."""
         for tag in ("[CHAT]", "[ACTION]"):
@@ -486,11 +511,11 @@ class UnifiedVLAWorker:
                 if len(self.conv_history) > self.MAX_HISTORY * 2:
                     self.conv_history = self.conv_history[-(self.MAX_HISTORY * 2):]
 
-                print(f"CHAT_REPLY {reply}", flush=True)
+                print(self._safe_str(f"CHAT_REPLY {reply}"), flush=True)
 
                 # Decide whether a physical action is also needed
                 if self.vla_ready and self._needs_action(arg, raw):
-                    print(f"ACTION_START {reply}", flush=True)
+                    print(self._safe_str(f"ACTION_START {reply}"), flush=True)
                     threading.Thread(
                         target=self.action_loop,
                         args=(arg, 60.0),

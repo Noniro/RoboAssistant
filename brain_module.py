@@ -75,6 +75,12 @@ class ReasoningBridge:
             grip_cam = cam_cfg.get("gripper_camera_index", 1)
             side_cam = cam_cfg.get("side_camera_index",   -1)
 
+            # Force UTF-8 I/O so the model's Unicode output (arrows, special
+            # chars) doesn't crash the Windows cp1252 pipe codec.
+            worker_env = os.environ.copy()
+            worker_env["PYTHONIOENCODING"] = "utf-8"
+            worker_env["PYTHONUTF8"]       = "1"
+
             self.unified_vla_process = subprocess.Popen(
                 [
                     sys.executable, "unified_vla_worker.py",
@@ -87,7 +93,10 @@ class ReasoningBridge:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 bufsize=1,
+                env=worker_env,
             )
             # Background thread reads all signals / replies from the worker
             threading.Thread(target=self._monitor_unified_vla, daemon=True).start()
@@ -312,6 +321,14 @@ class ReasoningBridge:
 
         try:
             if self.use_unified_vla and self.unified_vla_process:
+                # Guard: restart worker if it died (e.g. dtype crash on first run)
+                if self.unified_vla_process.poll() is not None:
+                    self.log_callback("[BRAIN] VLA worker exited unexpectedly — restarting...")
+                    self.vla_ready = False
+                    self._start_unified_vla()
+                    time.sleep(3)
+                    return "Restarting VLA model, please try again in a moment..."
+
                 # 1. Reasoning Phase
                 self.log_callback(f"[BRAIN] Asking Unified VLA (OpenVLA-7B): {user_text}")
                 self.last_vla_reply = None

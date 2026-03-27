@@ -208,24 +208,7 @@ class RobotSupervisorApp(ctk.CTk):
         
         self.mode_manager = ModeManager()
         
-        # Launcher UI
-        self.launcher_frame = ctk.CTkFrame(self.sidebar_frame)
-        self.launcher_frame.pack(pady=10, padx=20, fill="x")
-        
-        ctk.CTkLabel(self.launcher_frame, text="System Mode:", font=ctk.CTkFont(weight="bold")).pack(side="left", padx=5)
-        self.mode_var = ctk.StringVar(value=self.mode_manager.current_mode)
-        self.mode_dropdown = ctk.CTkOptionMenu(
-            self.launcher_frame, 
-            values=list(self.mode_manager.MODES.keys()),
-            variable=self.mode_var,
-            command=self.on_mode_change
-        )
-        self.mode_dropdown.pack(side="left", expand=True, fill="x", padx=5)
-
-        self.mode_settings_btn = ctk.CTkButton(
-            self.launcher_frame, text="⚙ Settings", width=80, command=self.open_mode_settings
-        )
-        self.mode_settings_btn.pack(side="left", padx=5)
+        # Mode is always General — no dropdown needed
         
         self.arm = ArmController(self.log_event)
         self.brain = ReasoningBridge(self.log_event, self.arm)
@@ -319,7 +302,7 @@ class RobotSupervisorApp(ctk.CTk):
         self.person_label.pack(pady=5)
 
         # Start/Stop Button
-        self.control_btn = ctk.CTkButton(self.sidebar_frame, text="Start System", command=self.toggle_system, fg_color="green")
+        self.control_btn = ctk.CTkButton(self.sidebar_frame, text="Stop System", command=self.toggle_system, fg_color="#c0392b")
         self.control_btn.pack(pady=20, padx=20, fill="x")
         
         # Camera bridge reader — reads frames written by the VLA worker subprocess.
@@ -566,10 +549,13 @@ class RobotSupervisorApp(ctk.CTk):
     def on_cameras_ready(self):
         """
         Called by brain_module when the VLA worker emits CAMERAS_READY.
-        Switches the UI feed source from placeholder text to the camera bridge.
+        Switches the UI feed to the camera bridge and auto-starts AI routines.
         """
         self._bridge_active = True
         self.log_event("[SYSTEM] VLA camera bridge active — displaying live feed.")
+        # Auto-start system now that cameras are live (runs in background while
+        # the VLA model finishes loading its weights)
+        self.after(500, self._auto_start_system)
 
     def change_voice(self, choice):
         self.save_settings()
@@ -741,32 +727,24 @@ class RobotSupervisorApp(ctk.CTk):
         self.chat_history.configure(state="disabled")
         self.chat_history.see("end")
 
+    def _auto_start_system(self):
+        """Called once after UI is ready. Starts in General mode automatically."""
+        if not self.system_running:
+            self.toggle_system()
+
     def toggle_system(self):
         self.system_running = not self.system_running
         if self.system_running:
-            self.control_btn.configure(text="Stop System")
-            self.mode_dropdown.configure(state="disabled") # Lock mode during run
-            
-            # Load only the models required for the current mode
-            mode_config = self.mode_manager.get_current_settings()
-            req_models = mode_config.get("required_models", [])
-            
-            self.log_event(f"[SYSTEM] Initializing {self.mode_manager.current_mode} Mode...")
-            
-            # 1. Load Brain models (VLM flag + Base Prompt)
-            base_prompt = mode_config.get("base_prompt")
-            self.brain.load_models(req_models, base_prompt=base_prompt)
-            self.brain.set_physical_interaction(mode_config.get("allow_physical_interaction", False))
-            
-            # 2. Load Vision models (YOLO / FaceRec)
-            self.vision.load_models(req_models)
-            self.vision.proactive_pulse_enabled = mode_config.get("proactive_pulse", True)
-            
-            self.log_event("[SYSTEM] Starting AI routines...")
+            self.control_btn.configure(text="Stop System", fg_color="#c0392b")
+            self.log_event("[SYSTEM] Starting AI routines (General mode)...")
+            # VLA handles visual reasoning — only load YOLO for UI overlay boxes
+            self.brain.load_models(["yolo"], base_prompt=None)
+            self.brain.set_physical_interaction(True)
+            self.vision.load_models(["yolo"])
+            self.vision.proactive_pulse_enabled = False
             self.vision.start()
         else:
-            self.control_btn.configure(text="Initialize System")
-            self.mode_dropdown.configure(state="normal")
+            self.control_btn.configure(text="Start System", fg_color="green")
             self.log_event("[SYSTEM] Stopping AI routines...")
             self.vision.stop()
 
@@ -779,12 +757,6 @@ class RobotSupervisorApp(ctk.CTk):
         gripper_frame, _ = self._cam_reader.read(CAM_GRIP)
         ret = (frame is not None)
         
-        # --- Security Mode: always detect on gripper for display; track only when enabled ---
-        if self.system_running and self.mode_manager.current_mode == "Security" and gripper_frame is not None:
-            mode_config = self.mode_manager.get_current_settings()
-            targets = mode_config.get("target_objects", []) if mode_config.get("enable_tracking", False) else []
-            self.vision.process_gripper_frame(gripper_frame, targets)
-                    
         # --- Render main camera ---
         if ret and frame is not None:
             # To prevent freezing, the vision module will process the frame asynchronously
@@ -877,10 +849,8 @@ class RobotSupervisorApp(ctk.CTk):
             cv2.circle(gripper_frame, (cx_frame, cy_frame), 8, (0, 255, 0), 1)
             
             # Status label
-            tracking_active = (self.system_running and 
-                               self.mode_manager.current_mode == "Security" and 
-                               self.mode_manager.get_current_settings().get("enable_tracking", False))
-            status_text = "TURRET MODE ON" if tracking_active else "TURRET MODE OFF"
+            tracking_active = False   # Turret/Security mode removed
+            status_text = "GRIPPER VIEW"
             status_color = (0, 255, 0) if tracking_active else (0, 100, 200)
             cv2.rectangle(gripper_frame, (0, 0), (150, 22), (0, 0, 0), -1)
             cv2.putText(gripper_frame, status_text, (5, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.5, status_color, 1)
