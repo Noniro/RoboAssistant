@@ -222,21 +222,32 @@ class UnifiedVLAWorker:
             base    = (
                 f"C:/Users/Noniro/.cache/huggingface/lerobot/local/{ds_name}"
             )
-            candidates = [
-                f"{base}/data/chunk-000/dataset.parquet",
-                f"{base}/data/chunk-000/chunk-000.parquet",
-                f"{base}/data/chunk-000.parquet",
-            ]
-            for path in candidates:
-                if os.path.exists(path):
-                    try:
-                        df   = pd.read_parquet(path)
-                        acts = np.vstack(df["action"].values)
-                        all_actions.append(acts)
-                        log.info(f"  {ds_name}: {len(acts)} frames loaded.")
-                    except Exception as exc:
-                        log.warning(f"  Could not load {path}: {exc}")
-                    break
+            chunk_dir = f"{base}/data/chunk-000"
+            # Collect all parquet files in the chunk directory
+            parquet_files = []
+            if os.path.isdir(chunk_dir):
+                parquet_files = [
+                    os.path.join(chunk_dir, f)
+                    for f in os.listdir(chunk_dir)
+                    if f.endswith(".parquet")
+                ]
+            if not parquet_files:
+                # Fallback: any parquet anywhere under data/
+                data_dir = f"{base}/data"
+                if os.path.isdir(data_dir):
+                    for root, _, files in os.walk(data_dir):
+                        for f in files:
+                            if f.endswith(".parquet"):
+                                parquet_files.append(os.path.join(root, f))
+            if parquet_files:
+                try:
+                    dfs  = [pd.read_parquet(p) for p in parquet_files]
+                    df   = pd.concat(dfs, ignore_index=True)
+                    acts = np.vstack(df["action"].values)
+                    all_actions.append(acts)
+                    log.info(f"  {ds_name}: {len(acts)} frames from {len(parquet_files)} file(s).")
+                except Exception as exc:
+                    log.warning(f"  Could not load parquets for {ds_name}: {exc}")
 
         if not all_actions:
             log.error("No dataset parquets found – using fallback [-1, 1] scale.")
@@ -346,14 +357,21 @@ class UnifiedVLAWorker:
     # ── Chat / classification ──────────────────────────────────────────────
     def chat_mode(self, user_text: str, image: Image.Image) -> str:
         """
-        Generate a response and embed a self-classification prefix.
+        Generate a conversational response using the BASE model (LoRA disabled).
 
-        The model is instructed to output:
-          [CHAT]   <reply>   – pure conversation
-          [ACTION] <reply>   – user wants physical manipulation
+        HOW IT WORKS
+        ─────────────
+        The LoRA fine-tuning trained the model ONLY on action data, so with the
+        adapter active every prompt — even "hey!" — causes it to generate action
+        tokens (IDs 31743-31999) which decode to non-ASCII garbage.
 
-        The prefix is used by _needs_action() before being stripped
-        from the displayed reply.
+        PEFT's disable_adapter() context manager bypasses the LoRA weights and
+        restores the original LLaMA-2 base model that CAN generate real text.
+        This is the "LLM personality" — pure language, no actions.
+
+        For physical actions, the adapter is re-enabled in action_loop().
+        The model itself classifies intent with [CHAT] / [ACTION] prefixes;
+        keyword scan acts as a reliable fallback.
         """
         history_block = ""
         history = self._build_history_str()
@@ -373,7 +391,10 @@ class UnifiedVLAWorker:
             "ASSISTANT:"
         )
 
-        out  = self._gen_tokens(prompt, image, max_new_tokens=80)
+        # Disable LoRA → base LLaMA-2 generates text tokens, not action tokens
+        with self.model.disable_adapter():
+            out = self._gen_tokens(prompt, image, max_new_tokens=80)
+
         text = self.processor.decode(out[0], skip_special_tokens=True)
 
         # Extract only the new ASSISTANT content
