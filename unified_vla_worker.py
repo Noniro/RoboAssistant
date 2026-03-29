@@ -404,24 +404,81 @@ class UnifiedVLAWorker:
         text = text.split("USER:")[0].strip()
         return text
 
+    # ── Task completion ─────────────────────────────────────────────────────
+    def check_task_complete(self, task: str, image: Image.Image) -> bool:
+        """
+        Ask the BASE model (LoRA disabled) to look at the current frame and
+        decide whether the task is visually complete.
+
+        Prompt is kept very short (max_new_tokens=5) so this adds only
+        ~200ms overhead per check (run every ~3 s during the action loop).
+        """
+        prompt = (
+            f"In: Has the task '{task}' been completed in this image? "
+            "Answer YES if done, NO if not done.\nOut:"
+        )
+        try:
+            with self.model.disable_adapter():
+                out = self._gen_tokens(
+                    prompt, image,
+                    max_new_tokens=5,
+                    do_sample=False,
+                    temperature=None,
+                )
+            text = self.processor.decode(out[0], skip_special_tokens=True).upper()
+            result = "YES" in text
+            log.info(f"Task completion check: {'DONE' if result else 'still running'} | raw='{text[-20:]}'")
+            return result
+        except Exception as exc:
+            log.warning(f"Completion check failed: {exc}")
+            return False
+
     # ── Action loop ────────────────────────────────────────────────────────
     def action_loop(self, task_instruction: str, duration_s: float) -> None:
         """
-        Run VLA inference loop for up to duration_s seconds.
-        Feeds frames from CAM_MAIN (top/overhead camera) – the same view
-        used during LoRA fine-tuning.
+        Run VLA inference loop until one of three stop conditions is met:
+
+        1. VISION CHECK  – every CHECK_EVERY steps the base model (LoRA off)
+                           looks at the camera and answers "task done? YES/NO".
+                           Stops on YES.  Best signal but adds ~200ms overhead
+                           every 3 seconds.
+
+        2. STILLNESS     – if the last STILL_WINDOW action vectors are all
+                           within STILL_THRESHOLD of each other the arm has
+                           stopped moving.  Robust fallback when the model
+                           keeps repeating the same home-position tokens.
+
+        3. TIMEOUT       – hard ceiling at duration_s seconds.
+
+        Uses CAM_MAIN (top/overhead) – the same view used during training.
         """
         self.active_action = True
-        # Prompt format MUST match the training script (train_openvla_lora.py)
         prompt   = f"In: What action should the robot take to {task_instruction}?\nOut:"
         deadline = time.perf_counter() + duration_s
+
+        # Completion-check tuning
+        CHECK_EVERY   = 30    # run vision check every N action steps (~3 s at 10 Hz)
+        STILL_WINDOW  = 15    # consecutive steps to consider arm "still"
+        STILL_THRESH  = 0.02  # normalised joint change below this = not moving
+
+        step           = 0
+        recent_targets : list[np.ndarray] = []
+        completion_reason = "timeout"
+
         log.info(f"Action started: '{task_instruction}' ({duration_s}s)")
 
         while time.perf_counter() < deadline and self.active_action:
             image = self.get_pil_frame(CAM_MAIN)
 
+            # ── Vision-based completion check (every CHECK_EVERY steps) ──
+            if step > 0 and step % CHECK_EVERY == 0:
+                if self.check_task_complete(task_instruction, image):
+                    completion_reason = "vision_check"
+                    break
+
             if self.robot is None:
                 time.sleep(0.5)
+                step += 1
                 continue
 
             try:
@@ -435,17 +492,26 @@ class UnifiedVLAWorker:
                         **inputs, max_new_tokens=7, do_sample=False
                     )
 
-                # Decode 7 action tokens → joint positions
-                pred_ids = out[0][-7:].cpu().numpy()
-                norm_acts = []
-                for tid in pred_ids:
-                    bin_idx = int(np.clip(31999 - int(tid), 0, 255))
-                    norm_acts.append(bin_idx / 255.0)
-
+                # Decode 7 action tokens → normalised joint positions
+                pred_ids  = out[0][-7:].cpu().numpy()
+                norm_acts = [
+                    int(np.clip(31999 - int(tid), 0, 255)) / 255.0
+                    for tid in pred_ids
+                ]
                 target = (
                     self.local_min
                     + np.array(norm_acts, dtype=np.float32) * self.action_range
                 )
+
+                # ── Stillness detection ───────────────────────────────────
+                recent_targets.append(target.copy())
+                if len(recent_targets) > STILL_WINDOW:
+                    recent_targets.pop(0)
+                if len(recent_targets) == STILL_WINDOW:
+                    spread = np.max(recent_targets, axis=0) - np.min(recent_targets, axis=0)
+                    if np.all(spread < STILL_THRESH):
+                        completion_reason = "stillness"
+                        break
 
                 joints = [
                     "shoulder_pan", "shoulder_lift", "elbow_flex",
@@ -462,10 +528,12 @@ class UnifiedVLAWorker:
                 log.error(f"Action step failed: {exc}")
                 break
 
+            step     += 1
             time.sleep(0.01)   # yield – ~100 Hz upper bound
 
         self.active_action = False
-        log.info("Action loop finished.")
+        log.info(f"Action loop finished. Reason: {completion_reason} after {step} steps.")
+        print(self._safe_str(f"TASK_DONE {completion_reason} after {step} steps"), flush=True)
         print("FINISHED", flush=True)
 
     # ══════════════════════════════════════════════════════════════════════

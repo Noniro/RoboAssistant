@@ -138,6 +138,19 @@ class ReasoningBridge:
                 if ui:
                     ui.after(0, ui.log_event, f"[ACTION] {action_desc}")
 
+            elif line.startswith("TASK_DONE"):
+                reason = line[len("TASK_DONE "):]
+                reason_map = {
+                    "vision_check": "VLM confirmed task complete",
+                    "stillness":    "arm stopped moving (task complete)",
+                    "timeout":      "time limit reached",
+                }
+                friendly = next((v for k, v in reason_map.items() if k in reason), reason)
+                self.log_callback(f"[VLA-WORKER] Task finished: {friendly}.")
+                ui = getattr(self, "ui_parent", None)
+                if ui:
+                    ui.after(0, ui.log_event, f"[TASK] {friendly}")
+
             elif line == "FINISHED":
                 self.log_callback("[VLA-WORKER] Physical action completed.")
 
