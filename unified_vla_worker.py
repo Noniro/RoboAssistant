@@ -385,31 +385,44 @@ class UnifiedVLAWorker:
         if history:
             history_block = f"\nPrevious conversation:\n{history}\n"
 
-        # LLaMA-2 instruction format — this is what the base model was trained on.
-        # Using a custom "USER:/ASSISTANT:" format causes the model to ignore
-        # language/role instructions and default to generating Chinese tokens.
+        # LLaMA-2 instruction format.
+        # IMPORTANT: We do NOT include <image> in this prompt.
+        # Passing text-only to the tokenizer (not the full processor) bypasses
+        # the vision backbone entirely. This prevents:
+        #   1. The 256 image-patch tokens from contaminating the decode
+        #   2. The model drifting into action-token generation mode
+        # The LoRA was trained only on action data, so any vision-aware prompt
+        # causes it to generate action tokens (Ÿ, 忠, etc.) even with
+        # disable_adapter(). Pure text input keeps it in LLM mode.
         system_msg = (
-            "You are a helpful English-speaking robotic lab assistant. "
-            "You can see the workspace through your camera: <image>. "
+            "You are a helpful robotic lab assistant. "
             "You have a 6-DOF robot arm with a gripper. "
-            "Always respond in English. Keep replies concise (1-2 sentences). "
-            "Start your reply with [CHAT] for conversation/questions, "
-            "or [ACTION] for requests to physically pick, place, move, grab, "
-            "lift, push, or manipulate objects."
+            "Respond in English only. Keep replies to 1-2 sentences. "
+            "Prefix your reply with [CHAT] for conversation "
+            "or [ACTION] for requests to pick, place, move, or grab objects."
         )
         if history_block:
-            system_msg += f"\n\nPrevious conversation:\n{history_block}"
+            system_msg += f"\n\nConversation history:\n{history_block}"
 
         prompt = (
             f"[INST] <<SYS>>\n{system_msg}\n<</SYS>>\n\n"
             f"{user_text} [/INST]"
         )
 
-        # Disable LoRA → base LLaMA-2 generates text tokens, not action tokens
+        # Text-only tokenization — skip the vision processor and vision backbone
         with self.model.disable_adapter():
-            out, prompt_len = self._gen_tokens(prompt, image, max_new_tokens=80)
+            inputs    = self.processor.tokenizer(
+                text=prompt, return_tensors="pt"
+            ).to(self.device)
+            prompt_len = inputs["input_ids"].shape[1]
+            with torch.inference_mode():
+                out = self.model.generate(
+                    **inputs,
+                    max_new_tokens=80,
+                    do_sample=True,
+                    temperature=0.7,
+                )
 
-        # Decode ONLY the newly generated tokens (skip prompt + image patches)
         new_tokens = out[0][prompt_len:]
         text = self.processor.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
         return text
@@ -423,10 +436,13 @@ class UnifiedVLAWorker:
         Prompt is kept very short (max_new_tokens=5) so this adds only
         ~200ms overhead per check (run every ~3 s during the action loop).
         """
+        # Text-only prompt — vision check via the full processor (with image)
+        # so the model can actually see the workspace.
         prompt = (
             f"[INST] <<SYS>>\nYou are a robot vision system. "
-            "Look at the camera image: <image>. Answer in English with YES or NO only.\n<</SYS>>\n\n"
-            f"Has the task '{task}' been completed in this image? [/INST]"
+            "The camera image shows the workspace: <image>. "
+            "Answer in English with YES or NO only.\n<</SYS>>\n\n"
+            f"Has the task '{task}' been completed? [/INST]"
         )
         try:
             with self.model.disable_adapter():
