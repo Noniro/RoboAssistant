@@ -64,10 +64,7 @@ import pandas as pd
 import cv2
 from PIL import Image
 
-from transformers import (
-    AutoModelForVision2Seq, AutoProcessor, BitsAndBytesConfig,
-    AutoModelForCausalLM, AutoTokenizer,
-)
+from transformers import AutoModelForVision2Seq, AutoProcessor, BitsAndBytesConfig
 from peft import PeftModel
 
 from camera_bridge import CameraWriter, CAM_MAIN, CAM_SIDE, CAM_GRIP
@@ -105,7 +102,6 @@ class UnifiedVLAWorker:
     def __init__(self, args: argparse.Namespace) -> None:
         self.base_model_id  = args.base_model
         self.adapter_path   = args.adapter
-        self.chat_model_id  = args.chat_model
         self.robot_config   = args.config
         self.main_cam_idx   = args.main_cam
         self.side_cam_idx   = args.side_cam
@@ -115,15 +111,11 @@ class UnifiedVLAWorker:
             "local/pick_place_Iloveyoublock",
         ]
 
-        # VLA model components (GPU – action inference only)
+        # Model components
         self.processor  = None
         self.model      = None
         self.robot      = None
         self.vla_ready  = False
-
-        # Chat model components (CPU – English conversation)
-        self.chat_tokenizer = None
-        self.chat_model     = None
 
         # Normalisation stats (derived from training data)
         self.local_min    : np.ndarray | None = None
@@ -315,13 +307,6 @@ class UnifiedVLAWorker:
             log.info("Robot hardware connected.")
 
         self.vla_ready = True
-
-        # ── Chat model (separate small model, runs on CPU) ────────────────
-        # OpenVLA cannot generate English text — its LLaMA-2 backbone was
-        # overwritten by robot action pretraining. We load a tiny dedicated
-        # chat model (Qwen2.5-0.5B-Instruct, ~500 MB) on CPU for conversation.
-        self._load_chat_model()
-
         print("READY", flush=True)
 
     # ══════════════════════════════════════════════════════════════════════
@@ -376,87 +361,20 @@ class UnifiedVLAWorker:
             )
         return out, prompt_len
 
-    # ── Chat model (CPU) ──────────────────────────────────────────────────
-    def _load_chat_model(self) -> None:
-        """
-        Load a small instruction-tuned LLM for English conversation on CPU.
-        This runs completely separately from the VLA (which is GPU-only for
-        action inference).  Default: Qwen/Qwen2.5-0.5B-Instruct (~500 MB).
-        """
-        model_id = self.chat_model_id
-        log.info(f"Loading chat model: {model_id}")
-        try:
-            self.chat_tokenizer = AutoTokenizer.from_pretrained(
-                model_id, trust_remote_code=True
-            )
-            self.chat_model = AutoModelForCausalLM.from_pretrained(
-                model_id,
-                torch_dtype=torch.float32,   # CPU – no bfloat16 needed
-                device_map="cpu",
-                trust_remote_code=True,
-            )
-            self.chat_model.eval()
-            log.info(f"Chat model ready on CPU.")
-        except Exception as exc:
-            log.warning(f"Chat model load failed: {exc}. Chat will use fallback responses.")
-            self.chat_model     = None
-            self.chat_tokenizer = None
-
     # ── Chat / classification ──────────────────────────────────────────────
     def chat_mode(self, user_text: str, image: Image.Image) -> str:
         """
-        Generate an English reply using the dedicated chat model (CPU).
-
-        WHY NOT THE VLA FOR CHAT
-        ─────────────────────────
-        OpenVLA's LLaMA-2 backbone was overwritten by continual pretraining
-        on robot manipulation data.  It can no longer generate English text —
-        it only produces action tokens (IDs 31743-31999) which decode as
-        Chinese/garbage characters.  disable_adapter() doesn't fix this
-        because the damage is in the base weights, not the LoRA delta.
-
-        ARCHITECTURE
-        ─────────────
-          Conversation  →  Qwen2.5-0.5B on CPU  (~500 MB, fast English)
-          Actions       →  OpenVLA-7B on GPU   (trained pick-and-place)
+        Pass the user text to OpenVLA and return whatever it generates.
+        OpenVLA was pretrained only on action data so it cannot produce
+        English text — responses will appear as Chinese/special characters.
+        This is expected behaviour and is accepted for now.
+        The [ACTION] keyword check still works correctly via _needs_action()
+        which scans the USER text, not the model reply.
         """
-        if self.chat_model is None or self.chat_tokenizer is None:
-            # Fallback if chat model failed to load
-            return "[CHAT] I'm ready! (chat model not loaded — check logs)"
-
-        history = self._build_history_str()
-        system_msg = (
-            "You are a helpful robotic lab assistant named RoboAssistant. "
-            "You have a 6-DOF robot arm with a gripper. "
-            "Keep replies concise (1-2 sentences). "
-            "Prefix your reply with [CHAT] for general conversation, "
-            "or [ACTION] if the user wants you to physically pick, place, "
-            "move, grab, lift, or manipulate any object."
-        )
-        messages = [{"role": "system", "content": system_msg}]
-        if history:
-            for turn in self.conv_history[-(self.MAX_HISTORY * 2):]:
-                messages.append(turn)
-        messages.append({"role": "user", "content": user_text})
-
-        # Use the chat template built into the tokenizer
-        text_input = self.chat_tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-        inputs     = self.chat_tokenizer(text_input, return_tensors="pt")
-        prompt_len = inputs["input_ids"].shape[1]
-
-        with torch.inference_mode():
-            out = self.chat_model.generate(
-                **inputs,
-                max_new_tokens=80,
-                do_sample=True,
-                temperature=0.7,
-                pad_token_id=self.chat_tokenizer.eos_token_id,
-            )
-
+        prompt = f"In: {user_text}\nOut:"
+        out, prompt_len = self._gen_tokens(prompt, image, max_new_tokens=20)
         new_tokens = out[0][prompt_len:]
-        return self.chat_tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+        return self.processor.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
 
     # ── Task completion ─────────────────────────────────────────────────────
     def check_task_complete(self, task: str, image: Image.Image) -> bool:
@@ -734,12 +652,10 @@ def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Unified VLA Worker – brain + body")
     p.add_argument("--config",     default="config.yaml",
                    help="Robot YAML config path")
-    p.add_argument("--base-model",  default="openvla/openvla-7b",
+    p.add_argument("--base-model", default="openvla/openvla-7b",
                    help="HuggingFace base model ID")
-    p.add_argument("--adapter",     default="outputs/train/vla_lora_adapter",
+    p.add_argument("--adapter",    default="outputs/train/vla_lora_adapter",
                    help="LoRA adapter checkpoint path")
-    p.add_argument("--chat-model",  default="Qwen/Qwen2.5-0.5B-Instruct",
-                   help="Small chat model for English conversation (runs on CPU)")
     p.add_argument("--main-cam",   type=int, default=0,
                    help="Main (top/overhead) camera index  [default: 0]")
     p.add_argument("--side-cam",   type=int, default=-1,
