@@ -385,17 +385,24 @@ class UnifiedVLAWorker:
         if history:
             history_block = f"\nPrevious conversation:\n{history}\n"
 
+        # LLaMA-2 instruction format — this is what the base model was trained on.
+        # Using a custom "USER:/ASSISTANT:" format causes the model to ignore
+        # language/role instructions and default to generating Chinese tokens.
+        system_msg = (
+            "You are a helpful English-speaking robotic lab assistant. "
+            "You can see the workspace through your camera: <image>. "
+            "You have a 6-DOF robot arm with a gripper. "
+            "Always respond in English. Keep replies concise (1-2 sentences). "
+            "Start your reply with [CHAT] for conversation/questions, "
+            "or [ACTION] for requests to physically pick, place, move, grab, "
+            "lift, push, or manipulate objects."
+        )
+        if history_block:
+            system_msg += f"\n\nPrevious conversation:\n{history_block}"
+
         prompt = (
-            "A chat between a user and a robotic lab assistant. "
-            "The assistant sees the workspace through its camera: <image>. "
-            "It is equipped with a 6-DOF arm and gripper.\n"
-            f"{history_block}"
-            "RULES — prefix every reply with one of these tags:\n"
-            "  [CHAT]   → casual conversation, questions, status, greetings\n"
-            "  [ACTION] → user asks to physically pick, place, move, grab,\n"
-            "             lift, push, carry, or otherwise manipulate objects\n"
-            f"USER: {user_text}\n"
-            "ASSISTANT:"
+            f"[INST] <<SYS>>\n{system_msg}\n<</SYS>>\n\n"
+            f"{user_text} [/INST]"
         )
 
         # Disable LoRA → base LLaMA-2 generates text tokens, not action tokens
@@ -417,8 +424,9 @@ class UnifiedVLAWorker:
         ~200ms overhead per check (run every ~3 s during the action loop).
         """
         prompt = (
-            f"In: Has the task '{task}' been completed in this image? "
-            "Answer YES if done, NO if not done.\nOut:"
+            f"[INST] <<SYS>>\nYou are a robot vision system. "
+            "Look at the camera image: <image>. Answer in English with YES or NO only.\n<</SYS>>\n\n"
+            f"Has the task '{task}' been completed in this image? [/INST]"
         )
         try:
             with self.model.disable_adapter():
