@@ -337,14 +337,21 @@ class UnifiedVLAWorker:
         max_new_tokens: int,
         do_sample: bool = True,
         temperature: float = 0.7,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, int]:
+        """
+        Returns (full_output_tensor, prompt_token_length).
+
+        Always use output[prompt_len:] when decoding to get ONLY the newly
+        generated tokens. Decoding out[0] directly includes 256 image-patch
+        tokens which produce non-ASCII garbage and break string parsing.
+        """
         inputs = self.processor(
             text=prompt, images=image, return_tensors="pt"
         ).to(self.device)
-        # Processor returns float32 pixel_values but the 8-bit-quantized vision
-        # backbone keeps its weights in float16 → cast to match before forward pass.
+        # Processor returns float32 pixel_values; vision backbone is float16
         if "pixel_values" in inputs and inputs["pixel_values"] is not None:
             inputs["pixel_values"] = inputs["pixel_values"].to(self._vision_dtype())
+        prompt_len = inputs["input_ids"].shape[1]
         with torch.inference_mode():
             out = self.model.generate(
                 **inputs,
@@ -352,7 +359,7 @@ class UnifiedVLAWorker:
                 do_sample=do_sample,
                 temperature=temperature if do_sample else None,
             )
-        return out
+        return out, prompt_len
 
     # ── Chat / classification ──────────────────────────────────────────────
     def chat_mode(self, user_text: str, image: Image.Image) -> str:
@@ -393,15 +400,11 @@ class UnifiedVLAWorker:
 
         # Disable LoRA → base LLaMA-2 generates text tokens, not action tokens
         with self.model.disable_adapter():
-            out = self._gen_tokens(prompt, image, max_new_tokens=80)
+            out, prompt_len = self._gen_tokens(prompt, image, max_new_tokens=80)
 
-        text = self.processor.decode(out[0], skip_special_tokens=True)
-
-        # Extract only the new ASSISTANT content
-        if "ASSISTANT:" in text:
-            text = text.split("ASSISTANT:")[-1]
-        # Trim any leaked USER turn
-        text = text.split("USER:")[0].strip()
+        # Decode ONLY the newly generated tokens (skip prompt + image patches)
+        new_tokens = out[0][prompt_len:]
+        text = self.processor.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
         return text
 
     # ── Task completion ─────────────────────────────────────────────────────
@@ -419,13 +422,14 @@ class UnifiedVLAWorker:
         )
         try:
             with self.model.disable_adapter():
-                out = self._gen_tokens(
+                out, prompt_len = self._gen_tokens(
                     prompt, image,
                     max_new_tokens=5,
                     do_sample=False,
                     temperature=None,
                 )
-            text = self.processor.decode(out[0], skip_special_tokens=True).upper()
+            new_tokens = out[0][prompt_len:]
+            text = self.processor.tokenizer.decode(new_tokens, skip_special_tokens=True).upper()
             result = "YES" in text
             log.info(f"Task completion check: {'DONE' if result else 'still running'} | raw='{text[-20:]}'")
             return result
@@ -487,13 +491,14 @@ class UnifiedVLAWorker:
                 ).to(self.device)
                 if "pixel_values" in inputs and inputs["pixel_values"] is not None:
                     inputs["pixel_values"] = inputs["pixel_values"].to(self._vision_dtype())
+                prompt_len = inputs["input_ids"].shape[1]
                 with torch.inference_mode():
                     out = self.model.generate(
                         **inputs, max_new_tokens=7, do_sample=False
                     )
 
-                # Decode 7 action tokens → normalised joint positions
-                pred_ids  = out[0][-7:].cpu().numpy()
+                # Decode exactly the 7 newly generated action tokens
+                pred_ids = out[0][prompt_len: prompt_len + 7].cpu().numpy()
                 norm_acts = [
                     int(np.clip(31999 - int(tid), 0, 255)) / 255.0
                     for tid in pred_ids
@@ -556,12 +561,20 @@ class UnifiedVLAWorker:
     @staticmethod
     def _safe_str(text: str) -> str:
         """
-        Make a string safe to print through a Windows pipe.
-        Replaces anything that can't round-trip through ASCII with '?'.
-        This prevents UnicodeEncodeError in colorama/wandb stdout wrappers
-        when the model generates Unicode arrows or special characters.
+        Make a string safe to print through the Windows UTF-8 pipe.
+        The subprocess is launched with PYTHONIOENCODING=utf-8 so valid UTF-8
+        (quotes, em-dashes, etc.) passes through fine.
+        Only truly unrepresentable codepoints are replaced with '?'.
+        Strips raw action-token garbage (codepoints in the Private Use Area
+        that the tokenizer maps high token IDs onto).
         """
-        return text.encode("ascii", errors="replace").decode("ascii")
+        # Remove characters that fall in Unicode Private Use Areas —
+        # these are what action-token IDs decode to when accidentally decoded
+        import re
+        text = re.sub(r'[\uE000-\uF8FF\U000F0000-\U000FFFFF\U00100000-\U0010FFFF]',
+                      '', text)
+        # Encode as UTF-8, replace any remaining unrepresentable bytes
+        return text.encode("utf-8", errors="replace").decode("utf-8")
 
     @staticmethod
     def _clean_reply(raw: str) -> str:
